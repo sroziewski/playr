@@ -1,0 +1,4 @@
+# Link the C runtime statically so playr.exe runs on a Windows install without the
+# Visual C++ redistributable: one file, no DLLs to ship.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
