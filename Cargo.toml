@@ -17,6 +17,10 @@ symphonia-adapter-opus-rs = "0.1.1"
 rustls-rustcrypto = "0.1.0-pre.0"
 ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 
+[build-dependencies]
+# Embeds assets/playr.ico into playr.exe; does nothing when the target is not Windows.
+embed-resource = "3.0.12"
+
 # Software video decoding is unusable unoptimised, so dependencies are always built with -O3;
 # only this crate's own code stays at the debug level in dev and test builds.
 [profile.dev.package."*"]

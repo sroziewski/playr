@@ -20,7 +20,9 @@ pub const STATIONS: &[(&str, &str)] = &[
     ("BBC World Service", "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"),
 ];
 
-const MEDIA_EXTENSIONS: &[&str] = &[
+/// File types the open dialog offers. The installers in `install/` register playr for exactly
+/// these with the desktop ("Open with"); `tests/installers.rs` keeps the lists equal.
+pub const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "mp3", "flac", "aac", "m4a", "ogg", "oga", "wav", "m3u", "m3u8", "pls",
 ];
 const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
@@ -351,10 +353,18 @@ impl eframe::App for App {
     }
 }
 
+/// The window and taskbar icon, decoded from `assets/playr.png`.
+pub fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/playr.png")).expect("assets/playr.png is a valid PNG")
+}
+
 pub fn run(initial: Option<String>) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("playr")
+            // On Linux the window is matched to playr.desktop (and its icon) by this app id.
+            .with_app_id("playr")
+            .with_icon(std::sync::Arc::new(window_icon()))
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([420.0, 260.0])
             .with_drag_and_drop(true),
