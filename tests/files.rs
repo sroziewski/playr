@@ -644,8 +644,9 @@ fn mp4_audio_on_a_48000_timescale_keeps_every_frame_of_its_ordinary_packets() {
 #[test]
 fn mp4_audio_with_a_millisecond_timescale_is_trimmed_to_within_a_tick_at_each_end() {
     // At 1000 ticks per second a 1024-frame packet (23.22 ms) is written as 23 ticks, the
-    // 204-frame last packet (4.6 ms) as 5 and the priming as 23. FFmpeg decodes 132317 sample
-    // frames from this file (`ffmpeg -i <file> -f f32le`, measured on the same patch).
+    // 204-frame last packet (4.6 ms) as 5 and the priming as 23. The samples are still those of
+    // sine.m4a, from which FFmpeg decodes 132300 sample frames: the patch changes only how
+    // their times are written, so 132300 is the signal that is really there.
     let path = sine_m4a_with_timescale(1000, 23, 5, 23);
     assert!((playr::demux::mp4_audio_priming_secs(&path) - 0.023).abs() < 1e-9);
     let (demuxed, err) = drain(open_path(&path).expect("open").as_mut());
@@ -661,11 +662,12 @@ fn mp4_audio_with_a_millisecond_timescale_is_trimmed_to_within_a_tick_at_each_en
     assert_eq!(trims[1..130].iter().filter(|t| **t != (0, None)).count(), 0, "ordinary packets are played whole");
     let (last_skip, last_limit) = trims[130];
     assert!(last_skip == 0 && last_limit.is_some_and(|l| l.abs_diff(204) <= tick), "last packet {:?}: about 204 frames", trims[130]);
-    // Two trimmed edges (priming, padding), each known to one tick.
+    // Two trimmed edges (priming, padding), each known to one 44.1-frame tick: the kept total
+    // may be off the real 132300 by 2 x 45 = 90 frames, no more.
     let audio = decode_audio(&demuxed);
     assert!(
-        audio.frames().abs_diff(132_317) <= 2 * tick as usize,
-        "{} sample frames kept, FFmpeg decodes 132317 (tolerance: one tick, {tick} frames, at each end)",
+        audio.frames().abs_diff(132_300) <= 2 * tick as usize,
+        "{} sample frames kept, the stream holds 132300 (tolerance: one tick, {tick} frames, at each end)",
         audio.frames()
     );
 }

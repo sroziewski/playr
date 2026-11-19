@@ -725,28 +725,27 @@ fn a_truncated_mp4_and_a_damaged_matroska_file_come_to_rest_with_the_demuxer_err
 
     // The MP4 reader refuses a media-data box that is longer than the file, so the cut MP4
     // yields an error before its first packet; the Matroska file plays its intact first part.
-    for (path, min_pictures, must_report) in [(cut_mp4, 0, true), (damaged_mkv, 10, false)] {
+    for (path, min_pictures, played_something) in [(cut_mp4, 0, false), (damaged_mkv, 10, true)] {
         let path = path.to_str().unwrap();
         let (status, frames) = play_damaged(&s, path);
 
-        assert!(matches!(status.state, State::Ended | State::Failed), "{path}: {status:?}");
         assert!(frames.len() >= min_pictures, "{path}: only {} pictures shown; {status:?}", frames.len());
         assert!(frames.len() <= 50 && frames.iter().all(|f| f.pts < 2.1), "{path}: more pictures than the part that is there");
-        let error = demuxer_error(path);
-        assert!(error.is_some() || !must_report, "{path}: test precondition: the demuxer reports an error for this file");
-        let said_why = |text: &str| status.notes.iter().any(|n| n == &format!("stopped early: {text}")) || status.error.as_deref() == Some(text);
-        match &error {
-            Some(error) => assert!(said_why(error), "{path}: neither notes {:?} nor error {:?} carry {error:?}", status.notes, status.error),
-            None => assert_eq!((status.state, status.notes.len()), (State::Ended, 0), "{path}: {status:?}"),
-        }
-        if must_report {
+        // Either way the reader's message is the one reason given for stopping.
+        assert_eq!(status.notes.len(), 1, "{path}: playback stopped short of the end and has to say why, once: {status:?}");
+        let error = demuxer_error(path).unwrap_or_else(|| panic!("{path}: test precondition: the demuxer reports an error for this file"));
+        assert_eq!(status.notes, [format!("stopped early: {error}")], "{path}: {status:?}");
+        if played_something {
+            // The intact first part was shown before the reader gave up: the file was played
+            // as far as it goes, which is an early end with a note and not a failure.
+            assert_eq!(status.state, State::Ended, "{path}: {status:?}");
+            assert_eq!(status.error, None, "{path}: {status:?}");
+        } else {
             // Nothing was shown or heard before the reader failed: that is a failure to play
             // the file, with the reader's message as the error and as the reason for stopping.
-            let error = error.expect("checked above");
             assert_eq!(frames.len(), 0, "{path}");
             assert_eq!(status.state, State::Failed, "{path}: {status:?}");
             assert_eq!(status.error.as_deref(), Some(error.as_str()), "{path}");
-            assert_eq!(status.notes, [format!("stopped early: {error}")], "{path}");
         }
         let position = s.player.shared.position();
         std::thread::sleep(Duration::from_millis(200));
