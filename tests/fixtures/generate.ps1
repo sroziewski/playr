@@ -79,7 +79,7 @@ Run ((Sine 4) + @('-c:a', 'libmp3lame', '-b:a', '64k', '-id3v2_version', '0', '-
 # --- reference data from FFmpeg's own decoders ---------------------------------------------
 # <name>.framecrc: Adler-32 and timestamp of every decoded picture (planar yuv420p).
 # <name>.f0.yuv / .f37.yuv: the raw planes of pictures 0 and 37 (an inter-coded one).
-foreach ($f in 'h264_aac.mp4', 'h264_bframes_aac.mp4', 'h264_vorbis.mkv', 'hevc_vorbis.mkv', 'hevc_aac.mp4', 'xvid_mp3.avi', 'xvid_pcm16.avi') {
+foreach ($f in 'h264_aac.mp4', 'h264_bframes_aac.mp4', 'h264_vorbis.mkv', 'hevc_vorbis.mkv', 'hevc_aac.mp4', 'hevc_big_hvcc_aac.mp4', 'xvid_mp3.avi', 'xvid_pcm16.avi') {
     Run @('-i', "$here\$f", '-map', '0:v:0', '-pix_fmt', 'yuv420p', '-fps_mode', 'passthrough', '-f', 'framecrc', "$here\$f.framecrc")
     Run @('-i', "$here\$f", '-map', '0:v:0', '-vf', 'select=eq(n\,0)', '-frames:v', '1', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', "$here\$f.f0.yuv")
     Run @('-i', "$here\$f", '-map', '0:v:0', '-vf', 'select=eq(n\,37)', '-frames:v', '1', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', "$here\$f.f37.yuv")

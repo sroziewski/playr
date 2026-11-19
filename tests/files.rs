@@ -30,6 +30,7 @@ fn video_cases() -> Vec<VideoCase> {
         case("h264_vorbis.mkv", "matroska", VideoCodec::H264, 2.0),
         case("hevc_vorbis.mkv", "matroska", VideoCodec::Hevc, 2.0),
         case("hevc_aac.mp4", "isomp4", VideoCodec::Hevc, 2.0),
+        case("hevc_big_hvcc_aac.mp4", "isomp4", VideoCodec::Hevc, 2.0),
         case("xvid_mp3.avi", "avi", VideoCodec::Mpeg4, 2.04),
         case("xvid_pcm16.avi", "avi", VideoCodec::Mpeg4, 2.0),
     ]
@@ -73,6 +74,7 @@ fn audio_cases() -> Vec<AudioCase> {
         case("h264_aac.mp4", "isomp4", 44100, 1, 88_200, 1024, 2.0, -21.07),
         case("h264_bframes_aac.mp4", "isomp4", 44100, 1, 88_200, 1024, 2.0, -21.07),
         case("hevc_aac.mp4", "isomp4", 44100, 1, 88_200, 1024, 2.0, -21.07),
+        case("hevc_big_hvcc_aac.mp4", "isomp4", 44100, 1, 88_200, 1024, 2.0, -21.09),
         case("h264_vorbis.mkv", "matroska", 44100, 2, 88_200, 1024, 2.0, -24.04),
         case("hevc_vorbis.mkv", "matroska", 44100, 2, 88_200, 1024, 2.0, -24.04),
         case("vp9_vorbis.mkv", "matroska", 44100, 2, 88_200, 1024, 2.0, -24.04),
@@ -225,7 +227,7 @@ const H264_FILES: [&str; 5] =
 #[test]
 fn hevc_and_mpeg4_picture_timestamps_match_ffmpeg() {
     let mut bad = Vec::new();
-    for file in ["hevc_vorbis.mkv", "hevc_aac.mp4", "xvid_mp3.avi", "xvid_pcm16.avi"] {
+    for file in ["hevc_vorbis.mkv", "hevc_aac.mp4", "hevc_big_hvcc_aac.mp4", "xvid_mp3.avi", "xvid_pcm16.avi"] {
         timestamp_mismatches(file, Duration::ZERO, &mut bad);
     }
     finish(bad);
@@ -499,14 +501,97 @@ fn avi_with_undecodable_picture_and_sound_reports_both_reasons() {
     assert_eq!(demuxed.audio.len(), 0);
 }
 
+/// symphonia-format-isomp4's refusal of an `hvcC` body over 1024 bytes, as `open_path` words it.
+const HVCC_TOO_BIG: &str = "unrecognised or unsupported format (malformed stream: isomp4 (hvcC): atom size is greater than 1 kb)";
+
+/// Offset of the `hvcC` box header in `bytes`, and its arrays as (offset of the NAL type byte
+/// in `bytes`, NAL unit type, NAL unit lengths). The fixture holds the four letters once.
+fn hvcc_layout(bytes: &[u8]) -> (usize, Vec<(usize, u8, Vec<usize>)>) {
+    assert_eq!(bytes.windows(4).filter(|w| w == b"hvcC").count(), 1, "fixture precondition: one hvcC");
+    let at = bytes.windows(4).position(|w| w == b"hvcC").unwrap() - 4;
+    let u16_at = |p: usize| u16::from_be_bytes([bytes[p], bytes[p + 1]]) as usize;
+    // Box header (8), then 22 bytes of the record before numOfArrays.
+    let mut pos = at + 8 + 23;
+    let arrays = (0..bytes[at + 8 + 22])
+        .map(|_| {
+            let (type_at, count) = (pos, u16_at(pos + 1));
+            pos += 3;
+            let lens = (0..count)
+                .map(|_| {
+                    let len = u16_at(pos);
+                    pos += 2 + len;
+                    len
+                })
+                .collect();
+            (type_at, bytes[type_at] & 0x3f, lens)
+        })
+        .collect();
+    (at, arrays)
+}
+
 #[test]
-fn hevc_in_mp4_with_an_oversized_configuration_record_is_rejected_with_a_message() {
-    // x265's default hvcC (with its version SEI) exceeds what the MP4 reader accepts. For now
-    // the accepted behaviour is a reported error; the reason in brackets is the format
-    // library's wording.
-    let err = open_path(&fixture("hevc_big_hvcc_aac.mp4")).err().expect("the file is not expected to open");
-    let prefix = "unrecognised or unsupported format (";
-    assert!(err.starts_with(prefix) && err.ends_with(')') && err.len() > prefix.len() + 1, "{err:?}");
+fn x265_default_hvcc_over_one_kilobyte_opens_as_hevc_with_audio() {
+    // The table tests above decode, compare and seek this file; this one pins why it is there.
+    let bytes = fixture_bytes("hevc_big_hvcc_aac.mp4");
+    let (at, arrays) = hvcc_layout(&bytes);
+    let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    assert!(size - 8 > 1024, "fixture precondition: hvcC body of {} bytes is over the 1 KB limit", size - 8);
+    let types: Vec<u8> = arrays.iter().map(|a| a.1).collect();
+    assert_eq!(types, [32, 33, 34, 39], "fixture precondition: VPS, SPS, PPS and a prefix SEI");
+
+    let demux = open_path(&fixture("hevc_big_hvcc_aac.mp4")).unwrap_or_else(|e| panic!("open: {e}"));
+
+    let info = demux.info();
+    let video = info.video.as_ref().expect("video track");
+    assert_eq!((video.codec.clone(), video.width, video.height), (VideoCodec::Hevc, 320, 240));
+    match &info.audio {
+        Some(AudioTrack::Symphonia(p)) => assert_eq!(p.sample_rate, Some(44100)),
+        other => panic!("audio track {other:?}, expected AAC at 44100 Hz"),
+    }
+    assert_eq!(info.container, "isomp4");
+}
+
+#[test]
+fn hvcc_still_over_one_kilobyte_without_its_sei_is_left_alone_and_rejected_as_before() {
+    // Relabelled as NAL type 35 (an access unit delimiter), the 2332-byte SEI is no longer
+    // something the patch may drop, so nothing is patched and the reader's own refusal stands.
+    let mut bytes = fixture_bytes("hevc_big_hvcc_aac.mp4");
+    let (_, arrays) = hvcc_layout(&bytes);
+    let sei_type_at = arrays[3].0;
+    bytes[sei_type_at] = (bytes[sei_type_at] & 0xc0) | 35;
+    let path = tmp_file("hvcc_big_without_sei.mp4", &bytes);
+
+    assert_eq!(playr::mp4_hvcc::patches_for(&path), Vec::new());
+    assert_eq!(open_path(&path).err().as_deref(), Some(HVCC_TOO_BIG));
+}
+
+#[test]
+fn malformed_oversized_hvcc_is_left_alone_and_rejected_as_before() {
+    // The SPS length is raised past the end of the record: the array walk cannot finish.
+    let mut bytes = fixture_bytes("hevc_big_hvcc_aac.mp4");
+    let (at, arrays) = hvcc_layout(&bytes);
+    let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as u16;
+    let sps_len_at = arrays[1].0 + 3;
+    bytes[sps_len_at..sps_len_at + 2].copy_from_slice(&size.to_be_bytes());
+    let path = tmp_file("hvcc_big_malformed.mp4", &bytes);
+
+    assert_eq!(playr::mp4_hvcc::patches_for(&path), Vec::new());
+    assert_eq!(open_path(&path).err().as_deref(), Some(HVCC_TOO_BIG));
+}
+
+#[test]
+fn files_that_need_no_patch_get_none() {
+    let mut files: Vec<&str> = video_cases().iter().map(|c| c.file).chain(audio_cases().iter().map(|c| c.file)).collect();
+    files.extend(["hevc_intra_aac.mp4", "h264_faststart_aac.mp4", "h264_longgop_aac.mp4", "mjpeg_ac3.avi", "radio.mp3", "sine.opus"]);
+    files.retain(|f| *f != "hevc_big_hvcc_aac.mp4");
+    files.sort_unstable();
+    files.dedup();
+    let mut bad = Vec::new();
+    for file in files {
+        let patches = playr::mp4_hvcc::patches_for(&fixture(file));
+        expect!(bad, patches.is_empty(), "{file}: {} patch(es) at {:?}", patches.len(), patches.iter().map(|p| p.offset).collect::<Vec<_>>());
+    }
+    finish(bad);
 }
 
 /// `sine.m4a` (131 AAC packets: 130 of 1024 frames, a last one of 204, 1024 frames of priming)
@@ -675,7 +760,7 @@ fn mp4_audio_with_a_millisecond_timescale_is_trimmed_to_within_a_tick_at_each_en
 #[test]
 fn seeking_past_the_end_fails_or_lands_inside_and_leaves_the_file_usable() {
     let mut bad = Vec::new();
-    for file in ["h264_aac.mp4", "h264_vorbis.mkv", "xvid_mp3.avi", "sine.m4a", "sine.flac", "sine.mp3", "sine.ogg", "sine.wav"] {
+    for file in ["h264_aac.mp4", "h264_vorbis.mkv", "xvid_mp3.avi", "hevc_big_hvcc_aac.mp4", "sine.m4a", "sine.flac", "sine.mp3", "sine.ogg", "sine.wav"] {
         let mut demux = open_path(&fixture(file)).unwrap();
         let duration = demux.info().duration.expect("duration");
         match demux.seek(duration + 100.0) {
@@ -911,6 +996,36 @@ mod seek {
             expect!(bad, second_pass.audio_trim == first_pass.audio_trim, "{file}: trim instructions differ after the rewind");
         }
         finish(bad);
+    }
+
+    #[test]
+    fn patched_hevc_file_read_to_its_end_seeks_like_the_same_encode_without_the_big_hvcc() {
+        // After the end the seek goes through a reopen, which has to patch the file again.
+        // hevc_aac.mp4 is the same x265 encode with info=0 (no SEI, a 119-byte hvcC, never
+        // patched): FFmpeg decodes the same 50 pictures from both (identical framecrc), so the
+        // patched file has to land, read and decode exactly like it.
+        let (patched, plain) = ("hevc_big_hvcc_aac.mp4", "hevc_aac.mp4");
+        assert_eq!(read_framecrc(patched), read_framecrc(plain), "fixture precondition: same pictures");
+        // (landing point, video pts, audio pts, picture (pts, Adler-32)) after the seek.
+        type After = (f64, Vec<f64>, Vec<f64>, Vec<(f64, u32)>);
+        let after = |file: &str, target: f64, read_to_end_first: bool| -> After {
+            let mut demux = open_path(&fixture(file)).unwrap();
+            if read_to_end_first {
+                assert_eq!(drain(demux.as_mut()).1, None, "{file}: first pass");
+            }
+            let landed = demux.seek(target).unwrap_or_else(|e| panic!("{file}: seek({target}): {e}"));
+            let (rest, err) = drain(demux.as_mut());
+            assert_eq!(err, None, "{file}: reading after seek({target})");
+            let pictures = decode_video(&rest).frames.iter().map(|f| (f.pts, adler32_ffmpeg(&packed_yuv(f)))).collect();
+            (landed, rest.video.iter().map(|v| v.0).collect(), rest.audio.iter().map(|a| a.0).collect(), pictures)
+        };
+        for target in [0.9, 1.3] {
+            let got = after(patched, target, true);
+            let want = after(plain, target, false);
+            assert!((0.0..=target + 1e-6).contains(&got.0), "seek({target}) after the end landed at {}", got.0);
+            assert!(!got.1.is_empty() && !got.2.is_empty(), "seek({target}): nothing read after the seek");
+            assert_eq!(got, want, "seek({target}) on {patched} after its end vs {plain} freshly opened");
+        }
     }
 
     #[test]

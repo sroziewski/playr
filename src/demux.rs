@@ -81,7 +81,7 @@ fn ts_secs(tb: Option<TimeBase>, ts: Timestamp) -> f64 {
 /// here; symphonia does not surface it, and playing it would put sound that much behind the
 /// picture.
 pub fn mp4_audio_priming_secs(path: &Path) -> f64 {
-    read_moov(path).and_then(|moov| audio_priming_from_moov(&moov)).unwrap_or(0.0)
+    read_moov(path).and_then(|(_, moov)| audio_priming_from_moov(&moov)).unwrap_or(0.0)
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
@@ -92,7 +92,7 @@ fn be64(b: &[u8], at: usize) -> Option<u64> {
     b.get(at..at + 8).map(|s| u64::from_be_bytes(s.try_into().expect("8 bytes")))
 }
 
-fn read_moov(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_moov(path: &Path) -> Option<(u64, Vec<u8>)> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut pos = 0u64;
@@ -119,7 +119,7 @@ fn read_moov(path: &Path) -> Option<Vec<u8>> {
             }
             let mut buf = vec![0u8; body as usize];
             file.read_exact(&mut buf).ok()?;
-            return Some(buf);
+            return Some((pos + header, buf));
         }
         pos = pos.checked_add(size)?;
     }
@@ -200,11 +200,18 @@ impl SymDemuxer {
     pub fn open_file(path: &Path) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
-        let mut demux = Self::open(Box::new(file), ext.as_deref(), None)?;
+        let moov = read_moov(path);
+        let patches = moov.as_ref().map(|(at, body)| crate::mp4_hvcc::patches_in(*at, body)).unwrap_or_default();
+        let source: Box<dyn MediaSource> = if patches.is_empty() {
+            Box::new(file)
+        } else {
+            Box::new(crate::mp4_hvcc::PatchedFile::new(file, patches).map_err(|e| format!("cannot open {}: {e}", path.display()))?)
+        };
+        let mut demux = Self::open(source, ext.as_deref(), None)?;
         demux.path = Some(path.to_path_buf());
         if demux.info.container == "isomp4" {
             demux.mp4_trim = true;
-            demux.priming_secs = mp4_audio_priming_secs(path);
+            demux.priming_secs = moov.as_ref().and_then(|(_, body)| audio_priming_from_moov(body)).unwrap_or(0.0);
             // The track length includes the priming that will not be played.
             if demux.info.video.is_none() {
                 demux.info.duration = demux.info.duration.map(|d| (d - demux.priming_secs).max(0.0));

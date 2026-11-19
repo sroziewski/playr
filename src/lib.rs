@@ -10,6 +10,7 @@ pub mod audio_out;
 pub mod avi;
 pub mod demux;
 pub mod media;
+pub mod mp4_hvcc;
 pub mod net;
 pub mod player;
 pub mod ui;
