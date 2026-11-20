@@ -6,19 +6,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, Key, RichText, ViewportCommand};
 use eframe::egui_glow;
 
+use crate::controls::{self, DEFAULT_STEP, Icon, SKIP_STEPS, Shortcut, SkipChain, icon_button, skip_label, step_label};
 use crate::media::format_time;
 use crate::net;
 use crate::player::{Player, State, Status};
+use crate::radio::{self, Station};
 use crate::video_gl::VideoRenderer;
-
-/// Stations offered in the Radio menu (name, address).
-pub const STATIONS: &[(&str, &str)] = &[
-    ("SomaFM Groove Salad (MP3)", "https://ice1.somafm.com/groovesalad-128-mp3"),
-    ("SomaFM Groove Salad (AAC)", "https://ice1.somafm.com/groovesalad-128-aac"),
-    ("SomaFM Indie Pop Rocks", "https://ice6.somafm.com/indiepop-128-mp3"),
-    ("SomaFM Drone Zone", "https://ice1.somafm.com/dronezone-128-mp3"),
-    ("BBC World Service", "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"),
-];
 
 /// File types the open dialog offers. The installers in `install/` register playr for exactly
 /// these with the desktop ("Open with"); `tests/installers.rs` keeps the lists equal.
@@ -26,7 +19,7 @@ pub const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "mp3", "flac", "aac", "m4a", "ogg", "oga", "wav", "m3u", "m3u8", "pls",
 ];
 const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
-const SEEK_STEP: f64 = 5.0;
+const OSD_FOR: Duration = Duration::from_millis(1200);
 
 pub struct App {
     player: Player,
@@ -39,6 +32,10 @@ pub struct App {
     volume: f32,
     url_open: bool,
     url_text: String,
+    skip_step: usize,
+    skip_chain: SkipChain,
+    osd: Option<(String, Instant)>,
+    radio_query: String,
 }
 
 impl App {
@@ -59,6 +56,10 @@ impl App {
             volume: 1.0,
             url_open: false,
             url_text: String::new(),
+            skip_step: DEFAULT_STEP,
+            skip_chain: SkipChain::default(),
+            osd: None,
+            radio_query: String::new(),
         }
     }
 
@@ -77,10 +78,24 @@ impl App {
         self.player.shared.audio.set_volume(self.volume);
     }
 
-    fn seek_by(&self, status: &Status, delta: f64) {
-        if status.seekable {
-            self.player.seek(self.player.shared.position() + delta);
+    fn skip(&mut self, status: &Status, delta: f64) {
+        if !status.seekable {
+            self.osd = Some((controls::no_skip_reason(status.live).to_string(), Instant::now()));
+            return;
         }
+        let to = self.skip_chain.skip(self.player.shared.position(), delta, status.duration, Instant::now());
+        self.player.seek(to);
+        self.osd = Some((format!("{}   →   {}", skip_label(delta), format_time(to)), Instant::now()));
+    }
+
+    fn set_skip_step(&mut self, step: usize) {
+        self.skip_step = step;
+        self.osd = Some((format!("Skip step: {}", step_label(SKIP_STEPS[self.skip_step])), Instant::now()));
+    }
+
+    fn toggle_fullscreen(ctx: &egui::Context) {
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
     }
 
     fn handle_input(&mut self, ctx: &egui::Context, status: &Status) {
@@ -95,38 +110,39 @@ impl App {
         if self.url_open {
             return;
         }
-        let pressed = |key: Key| ctx.input(|i| i.key_pressed(key));
-        if pressed(Key::Space) {
-            self.player.toggle_pause();
-        }
-        if pressed(Key::ArrowLeft) {
-            self.seek_by(status, -SEEK_STEP);
-        }
-        if pressed(Key::ArrowRight) {
-            self.seek_by(status, SEEK_STEP);
-        }
-        if pressed(Key::ArrowUp) {
-            self.set_volume(self.volume + 0.05);
-        }
-        if pressed(Key::ArrowDown) {
-            self.set_volume(self.volume - 0.05);
-        }
-        if pressed(Key::M) {
-            let audio = &self.player.shared.audio;
-            audio.set_muted(!audio.is_muted());
-        }
-        if pressed(Key::O) {
-            self.open_dialog();
-        }
-        if pressed(Key::U) {
-            self.url_open = true;
-        }
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if pressed(Key::F) {
-            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
-        }
-        if pressed(Key::Escape) && fullscreen {
-            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        let text_focused = ctx.text_edit_focused();
+        let keys: Vec<Key> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        });
+        let step = SKIP_STEPS[self.skip_step];
+        for shortcut in keys.into_iter().filter_map(|key| controls::shortcut(key, text_focused)) {
+            match shortcut {
+                Shortcut::PlayPause => self.player.toggle_pause(),
+                Shortcut::SkipBack => self.skip(status, -step),
+                Shortcut::SkipForward => self.skip(status, step),
+                Shortcut::ShorterStep => self.set_skip_step(controls::step_after(self.skip_step, -1)),
+                Shortcut::LongerStep => self.set_skip_step(controls::step_after(self.skip_step, 1)),
+                Shortcut::VolumeUp => self.set_volume(self.volume + 0.05),
+                Shortcut::VolumeDown => self.set_volume(self.volume - 0.05),
+                Shortcut::Mute => {
+                    let audio = &self.player.shared.audio;
+                    audio.set_muted(!audio.is_muted());
+                }
+                Shortcut::OpenFile => self.open_dialog(),
+                Shortcut::OpenUrl => self.url_open = true,
+                Shortcut::ToggleFullscreen => Self::toggle_fullscreen(ctx),
+                Shortcut::LeaveFullscreen => {
+                    if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    }
+                }
+            }
         }
     }
 
@@ -135,8 +151,7 @@ impl App {
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         let response = ui.interact(rect, ui.scope_id().with("stage"), egui::Sense::click());
         if response.double_clicked() {
-            let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-            ui.ctx().send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+            Self::toggle_fullscreen(ui.ctx());
         }
 
         let size = self.frame_size.or(status.video).filter(|&(w, h)| w > 0 && h > 0);
@@ -178,6 +193,23 @@ impl App {
             let galley = ui.painter().text(egui::pos2(rect.left() + 12.0, y), Align2::LEFT_TOP, text, egui::FontId::proportional(13.0), color);
             y += galley.height() + 4.0;
         }
+        self.draw_osd(ui, rect);
+    }
+
+    fn draw_osd(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some((text, at)) = &self.osd else { return };
+        let shown = at.elapsed();
+        if shown >= OSD_FOR {
+            self.osd = None;
+            return;
+        }
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(22.0), Color32::WHITE);
+        let center = egui::pos2(rect.center().x, rect.top() + 28.0 + galley.size().y / 2.0);
+        let frame = egui::Rect::from_center_size(center, galley.size() + egui::vec2(28.0, 14.0));
+        painter.rect_filled(frame, 8.0, Color32::from_black_alpha(170));
+        painter.galley(center - galley.size() / 2.0, galley, Color32::WHITE);
+        ui.ctx().request_repaint_after(OSD_FOR - shown);
     }
 
     fn draw_controls(&mut self, ctx: &egui::Context, status: &Status, position: f64) {
@@ -212,8 +244,10 @@ impl App {
             }
             if slider.drag_stopped() {
                 self.seek_drag = None;
+                self.skip_chain.reset();
                 self.player.seek(value);
             } else if slider.changed() && !slider.dragged() {
+                self.skip_chain.reset();
                 self.player.seek(value);
             }
             ui.monospace(tail);
@@ -221,40 +255,67 @@ impl App {
     }
 
     fn button_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let shared = self.player.shared.clone();
             let playing = status.state == State::Playing && !shared.is_paused();
             let can_play = matches!(status.state, State::Playing | State::Ended);
-            if ui.add_enabled(can_play, egui::Button::new(if playing { "⏸" } else { "▶" })).clicked() {
+            let step = SKIP_STEPS[self.skip_step];
+            let no_skip = controls::no_skip_reason(status.live);
+
+            let back = icon_button(ui, Icon::SkipBack, &step_label(step), status.seekable)
+                .on_hover_text(format!("Back {} (←)", step_label(step)))
+                .on_disabled_hover_text(no_skip);
+            if back.clicked() {
+                self.skip(status, -step);
+            }
+            let (icon, tip) = if playing { (Icon::Pause, "Pause (Space)") } else { (Icon::Play, "Play (Space)") };
+            if icon_button(ui, icon, "", can_play).on_hover_text(tip).clicked() {
                 self.player.toggle_pause();
             }
+            let forward = icon_button(ui, Icon::SkipForward, &step_label(step), status.seekable)
+                .on_hover_text(format!("Forward {} (→)", step_label(step)))
+                .on_disabled_hover_text(no_skip);
+            if forward.clicked() {
+                self.skip(status, step);
+            }
+            ui.add_enabled_ui(status.seekable, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (i, secs) in SKIP_STEPS.iter().enumerate() {
+                    let chip = ui
+                        .add(egui::Button::selectable(i == self.skip_step, step_label(*secs)).small())
+                        .on_hover_text("Skip step for the skip buttons and the arrow keys ([ and ] change it)");
+                    if chip.clicked() {
+                        self.skip_step = i;
+                    }
+                }
+            });
+            ui.separator();
             let muted = shared.audio.is_muted();
-            if ui.button(if muted { "🔇" } else { "🔊" }).clicked() {
+            if ui.button(if muted { "🔇" } else { "🔊" }).on_hover_text("Mute (M)").clicked() {
                 shared.audio.set_muted(!muted);
             }
             ui.spacing_mut().slider_width = 90.0;
             let mut volume = self.volume;
-            if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false)).changed() {
+            if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false)).on_hover_text("Volume (↑ ↓)").changed() {
                 self.set_volume(volume);
             }
             ui.separator();
-            if ui.button("Open").clicked() {
+            if ui.button("Open").on_hover_text("Open a file (O)").clicked() {
                 self.open_dialog();
             }
-            if ui.button("URL").clicked() {
+            if ui.button("URL").on_hover_text("Open an address (U)").clicked() {
                 self.url_open = true;
             }
-            ui.menu_button("Radio", |ui| {
-                for (name, url) in STATIONS {
-                    if ui.button(*name).clicked() {
-                        self.player.open(*url);
-                        ui.close();
-                    }
-                }
-            });
-            if ui.button("⛶").clicked() {
-                let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+            let radio_label = if radio::find_by_url(&status.source).is_some() { "📻 Radio ●" } else { "📻 Radio" };
+            ui.menu_button(radio_label, |ui| self.radio_menu(ui, status));
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            let (icon, tip) = if fullscreen {
+                (Icon::ExitFullscreen, "Exit full screen (F12, F, Esc)")
+            } else {
+                (Icon::EnterFullscreen, "Full screen (F12, F, double-click)")
+            };
+            if icon_button(ui, icon, "", true).on_hover_text(tip).clicked() {
+                Self::toggle_fullscreen(ctx);
             }
             ui.separator();
             let text = match (&status.now_playing, status.title.is_empty()) {
@@ -264,6 +325,52 @@ impl App {
             };
             ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
         });
+    }
+
+    fn radio_menu(&mut self, ui: &mut egui::Ui, status: &Status) {
+        ui.set_min_width(280.0);
+        ui.add(egui::TextEdit::singleline(&mut self.radio_query).hint_text("Search stations or genres…").desired_width(260.0));
+        ui.separator();
+        let playing = status.source.as_str();
+        if self.radio_query.trim().is_empty() {
+            for section in radio::sections() {
+                if std::ptr::eq(section, &radio::RUSSIAN) {
+                    ui.separator();
+                }
+                let current = section.contains(playing);
+                let label = if current { format!("● {}", section.name) } else { section.name.to_string() };
+                ui.menu_button(label, |ui| {
+                    for station in section.stations {
+                        self.station_button(ui, station, None, playing);
+                    }
+                });
+            }
+            return;
+        }
+        let found = radio::search(&self.radio_query);
+        if found.is_empty() {
+            ui.weak("No station matches");
+            return;
+        }
+        egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+            for (section, station) in found {
+                self.station_button(ui, station, Some(section.name), playing);
+            }
+        });
+    }
+
+    fn station_button(&self, ui: &mut egui::Ui, station: &Station, section: Option<&str>, playing: &str) {
+        let current = station.url == playing;
+        let mut job = egui::text::LayoutJob::default();
+        let name = if current { RichText::new(station.name).strong() } else { RichText::new(station.name) };
+        name.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+        if let Some(section) = section {
+            RichText::new(format!("   {section}")).weak().small().append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+        }
+        if ui.add(egui::Button::selectable(current, job)).on_hover_text(station.url).clicked() {
+            self.player.open(station.url);
+            ui.close();
+        }
     }
 
     fn draw_url_dialog(&mut self, ctx: &egui::Context) {
@@ -307,6 +414,7 @@ impl eframe::App for App {
             self.last_source = status.source.clone();
             self.frame_size = None;
             self.renderer.lock().unwrap().clear();
+            self.skip_chain.reset();
         }
         let title = if status.title.is_empty() { "playr".to_string() } else { format!("{} — playr", status.title) };
         if title != self.last_title {

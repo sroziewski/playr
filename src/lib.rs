@@ -8,11 +8,13 @@
 
 pub mod audio_out;
 pub mod avi;
+pub mod controls;
 pub mod demux;
 pub mod media;
 pub mod mp4_hvcc;
 pub mod net;
 pub mod player;
+pub mod radio;
 pub mod ui;
 pub mod vdec;
 pub mod video_gl;
