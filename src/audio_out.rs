@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::stretch::Stretcher;
+
 pub struct AudioShared {
-    buf: Mutex<VecDeque<f32>>,
+    buf: Mutex<(VecDeque<f32>, Stretcher)>,
     played_frames: AtomicU64,
     channels: AtomicU32,
     rate: AtomicU32,
@@ -23,12 +25,13 @@ pub struct AudioShared {
     /// The device reported an error (unplugged, default device changed); the stream is dead.
     device_error: AtomicBool,
     volume_bits: AtomicU32,
+    speed_bits: AtomicU64,
 }
 
 impl Default for AudioShared {
     fn default() -> Self {
         Self {
-            buf: Mutex::new(VecDeque::new()),
+            buf: Mutex::new((VecDeque::new(), Stretcher::default())),
             played_frames: AtomicU64::new(0),
             channels: AtomicU32::new(2),
             rate: AtomicU32::new(48000),
@@ -37,6 +40,7 @@ impl Default for AudioShared {
             free_run: AtomicBool::new(false),
             device_error: AtomicBool::new(false),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
+            speed_bits: AtomicU64::new(1.0f64.to_bits()),
         }
     }
 }
@@ -98,13 +102,23 @@ impl AudioShared {
         f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
     }
 
+    pub fn set_speed(&self, speed: f64) {
+        let s = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+        self.speed_bits.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn speed(&self) -> f64 {
+        f64::from_bits(self.speed_bits.load(Ordering::Relaxed))
+    }
+
     /// Queues interleaved samples in the device's channel layout.
     pub fn push(&self, samples: &[f32]) {
-        self.buf.lock().unwrap().extend(samples.iter().copied());
+        self.buf.lock().unwrap().0.extend(samples.iter().copied());
     }
 
     pub fn buffered_frames(&self) -> usize {
-        self.buf.lock().unwrap().len() / self.channels().max(1)
+        let queue = self.buf.lock().unwrap();
+        (queue.0.len() / self.channels().max(1)).saturating_sub(queue.1.played_frames_held())
     }
 
     pub fn buffered_secs(&self) -> f64 {
@@ -118,8 +132,9 @@ impl AudioShared {
 
     /// Drops everything queued and restarts the frame count (used on open and on seek).
     pub fn reset(&self) {
-        let mut buf = self.buf.lock().unwrap();
-        buf.clear();
+        let mut queue = self.buf.lock().unwrap();
+        queue.0.clear();
+        queue.1.reset();
         self.played_frames.store(0, Ordering::Relaxed);
     }
 
@@ -132,19 +147,34 @@ impl AudioShared {
             return;
         }
         let gain = if self.is_muted() { 0.0 } else { self.volume() };
-        let mut buf = self.buf.lock().unwrap();
-        // Only whole frames, so a channel can never slip into its neighbour's slot.
-        let take = out.len().min(buf.len()) / channels * channels;
-        for (dst, src) in out.iter_mut().zip(buf.drain(..take)) {
-            *dst = src * gain;
+        let speed = self.speed();
+        let mut queue = self.buf.lock().unwrap();
+        let (buf, stretch) = &mut *queue;
+        let mut filled = 0;
+        let mut frames = 0u64;
+        if speed != 1.0 || stretch.is_active() {
+            let done = stretch.render(buf, out, speed, self.rate(), channels);
+            filled = done.samples;
+            frames = done.media_frames;
         }
-        drop(buf);
-        out[take..].fill(0.0);
-        let mut frames = take / channels;
+        if !stretch.is_active() {
+            // Only whole frames, so a channel can never slip into its neighbour's slot.
+            let take = (out.len() - filled).min(buf.len()) / channels * channels;
+            for (dst, src) in out[filled..filled + take].iter_mut().zip(buf.drain(..take)) {
+                *dst = src;
+            }
+            filled += take;
+            frames += (take / channels) as u64;
+        }
+        drop(queue);
+        for sample in &mut out[..filled] {
+            *sample *= gain;
+        }
+        out[filled..].fill(0.0);
         if self.is_free_run() {
-            frames = out.len() / channels;
+            frames = ((out.len() / channels) as f64 * speed).round() as u64;
         }
-        self.played_frames.fetch_add(frames as u64, Ordering::Relaxed);
+        self.played_frames.fetch_add(frames, Ordering::Relaxed);
     }
 }
 

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Shape, pos2, vec2};
 use playr::controls::{
-    CHAIN_WINDOW, DEFAULT_STEP, Icon, SKIP_STEPS, Shortcut, SkipChain, icon_button, no_skip_reason, paint_icon, shortcut,
-    skip_label, skip_target, step_after, step_label,
+    CHAIN_WINDOW, DEFAULT_STEP, Icon, SKIP_STEPS, SPEEDS, Shortcut, SkipChain, icon_button, no_skip_reason, paint_icon,
+    pasted_target, shortcut, skip_label, skip_target, speed_after, speed_label, step_after, step_label,
 };
 
 const MINUS: char = '\u{2212}';
@@ -223,7 +223,93 @@ fn no_skip_reason_tells_a_live_stream_from_other_unseekable_media() {
     assert_eq!(no_skip_reason(false), "This media cannot be skipped through");
 }
 
-const BOUND_KEYS: [(Key, Shortcut); 13] = [
+#[test]
+fn pasted_text_opens_as_a_trimmed_url_or_an_existing_unquoted_path_and_nothing_else() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let existing = root.join("Cargo.toml").to_string_lossy().into_owned();
+    let missing = root.join("no-such-file.mp4").to_string_lossy().into_owned();
+    let s = |x: &str| Some(x.to_string());
+    let cases = [
+        ("url with surrounding whitespace", "  https://youtu.be/aB3_-x9Zq0Y \r\n".to_string(), s("https://youtu.be/aB3_-x9Zq0Y")),
+        ("plain http url", "http://radio.example:8000/stream".to_string(), s("http://radio.example:8000/stream")),
+        ("quoted existing path", format!(" \"{existing}\" "), Some(existing.clone())),
+        ("unquoted existing path", existing.clone(), Some(existing.clone())),
+        ("missing path", format!("\"{missing}\""), None),
+        ("existing folder", env!("CARGO_MANIFEST_DIR").to_string(), None),
+        ("plain words", "not a link".to_string(), None),
+        ("other scheme", "ftp://files.example/a.mp3".to_string(), None),
+        ("empty", String::new(), None),
+        ("whitespace", " \t\n ".to_string(), None),
+        ("empty quotes", "\"\"".to_string(), None),
+    ];
+    let mut bad = Vec::new();
+    for (case, text, expected) in cases {
+        let actual = pasted_target(&text);
+        if actual != expected {
+            bad.push(format!("{case}: pasted_target({text:?}) = {actual:?}, expected {expected:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn the_speeds_are_youtubes_eight_steps() {
+    assert_eq!(SPEEDS, [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]);
+}
+
+#[test]
+fn speed_label_drops_trailing_zeros_and_uses_the_multiplication_sign() {
+    let cases = [(1.0, "1×"), (1.25, "1.25×"), (0.5, "0.5×"), (0.25, "0.25×"), (2.0, "2×"), (1.333_333, "1.33×"), (0.756, "0.76×")];
+    let mut bad = Vec::new();
+    for (speed, expected) in cases {
+        let actual = speed_label(speed);
+        if actual != expected {
+            bad.push(format!("speed_label({speed}) = {actual:?}, expected {expected:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(speed_label(1.5).ends_with('\u{d7}'), "U+00D7, not the letter x");
+}
+
+#[test]
+fn speed_after_steps_through_the_speeds_and_stops_at_both_ends() {
+    let cases: [(f64, isize, f64); 18] = [
+        (1.0, 1, 1.25),
+        (1.0, -1, 0.75),
+        (1.0, 0, 1.0),
+        (1.0, 3, 1.75),
+        (1.0, -3, 0.25),
+        (0.5, 2, 1.0),
+        (2.0, 1, 2.0),
+        (0.25, -1, 0.25),
+        (1.0, 100, 2.0),
+        (0.5, -100, 0.25),
+        (1.0, isize::MAX, 2.0),
+        (1.0, isize::MIN, 0.25),
+        (1.1, 1, 1.25),
+        (1.1, -1, 1.0),
+        (1.1, 0, 1.1),
+        (3.0, -1, 2.0),
+        (0.1, 1, 0.25),
+        (1.25 + 1e-12, 1, 1.5),
+    ];
+    let mut bad = Vec::new();
+    for (current, delta, expected) in cases {
+        let actual = speed_after(current, delta);
+        if actual != expected {
+            bad.push(format!("speed_after({current}, {delta}) = {actual}, expected {expected}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn speed_after_clamps_speeds_outside_the_range_into_it() {
+    assert_eq!(speed_after(3.0, 1), 2.0);
+    assert_eq!(speed_after(0.1, -1), 0.25);
+}
+
+const BOUND_KEYS: [(Key, Shortcut); 16] = [
     (Key::Space, Shortcut::PlayPause),
     (Key::ArrowLeft, Shortcut::SkipBack),
     (Key::ArrowRight, Shortcut::SkipForward),
@@ -237,6 +323,9 @@ const BOUND_KEYS: [(Key, Shortcut); 13] = [
     (Key::F, Shortcut::ToggleFullscreen),
     (Key::F12, Shortcut::ToggleFullscreen),
     (Key::Escape, Shortcut::LeaveFullscreen),
+    (Key::Comma, Shortcut::Slower),
+    (Key::Period, Shortcut::Faster),
+    (Key::C, Shortcut::ToggleCaptions),
 ];
 
 #[test]
@@ -256,7 +345,7 @@ fn every_other_key_gives_no_shortcut() {
     let unbound: Vec<Key> = Key::ALL.iter().copied().filter(|k| !BOUND_KEYS.iter().any(|(b, _)| b == k)).collect();
     let bound_hits: Vec<(Key, Shortcut)> = unbound.iter().filter_map(|&k| shortcut(k, false).map(|s| (k, s))).collect();
 
-    assert_eq!(unbound.len(), Key::ALL.len() - 13, "13 distinct keys are bound");
+    assert_eq!(unbound.len(), Key::ALL.len() - 16, "16 distinct keys are bound");
     for key in [Key::A, Key::Enter, Key::F11, Key::Tab, Key::Num5] {
         assert!(unbound.contains(&key), "{key:?} must be among the unbound keys tested");
     }
@@ -281,12 +370,13 @@ fn click_icon_button(enabled: bool) -> (Vec<bool>, bool) {
     let mut frame = |time: f64, events: Vec<egui::Event>| -> Rect {
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
         let mut rect = Rect::NOTHING;
-        let _ = ctx.run_ui(input, |ui| {
+        let mut output = ctx.run_ui(input, |ui| {
             let response = icon_button(ui, Icon::SkipForward, "+30 s", enabled);
             rect = response.rect;
             seen_enabled.push(response.enabled());
             clicked |= response.clicked();
         });
+        output.textures_delta.clear();
         rect
     };
     let rect = frame(0.0, vec![]);
@@ -340,9 +430,10 @@ fn flatten(shape: Shape, out: &mut Vec<Shape>) {
 /// The shapes `paint_icon` adds for `icon` inside [`icon_rect`] in [`INK`].
 fn painted(icon: Icon) -> Vec<Drawn> {
     let ctx = egui::Context::default();
-    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         paint_icon(ui.painter(), icon_rect(), icon, INK);
     });
+    output.textures_delta.clear();
     let mut shapes = Vec::new();
     for clipped in output.shapes {
         flatten(clipped.shape, &mut shapes);

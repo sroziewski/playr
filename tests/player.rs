@@ -397,6 +397,54 @@ fn pause_holds_the_position_and_resume_continues_from_it() {
     assert!(resumed < held + 2.0, "resumed at {resumed} after pausing at {held}: the paused time was not left out");
 }
 
+fn play_a_fresh_copy_of_sine_at(s: &Session, speed: f64) -> (f64, f64, Status) {
+    s.player.set_speed(speed);
+    let copy = tmp_file(&format!("player_sine_at_{speed}.flac"), &fixture_bytes("sine.flac"));
+    let status = s.open(copy.to_str().expect("utf-8 path"));
+    assert_eq!(status.state, State::Playing, "speed {speed}: {status:?}");
+    let (started, from) = wait_for(&s.player, "the clock to start", Duration::from_secs(10), || {
+        let p = s.player.shared.position();
+        (p > 0.05).then(|| (Instant::now(), p))
+    });
+    let ended = wait_for_state(&s.player, State::Ended, Duration::from_secs(15));
+    let wall = started.elapsed().as_secs_f64();
+    (wall, s.player.shared.position() - from, ended)
+}
+
+#[test]
+fn opening_a_live_stream_returns_to_normal_speed_while_a_file_keeps_the_chosen_one() {
+    let server = RadioServer::start(fixture_bytes("radio.mp3"));
+    let s = start();
+    s.player.set_speed(1.5);
+
+    let file = s.open(&path_of("sine.flac"));
+    let speed_on_file = (s.player.shared.speed(), s.player.shared.audio.speed());
+    let live = s.open(&server.url("/stream"));
+
+    assert_eq!((file.state, file.seekable), (State::Playing, true), "{file:?}");
+    assert_eq!(speed_on_file, (1.5, 1.5));
+    assert_eq!((live.state, live.seekable), (State::Playing, false), "{live:?}");
+    assert_eq!((s.player.shared.speed(), s.player.shared.audio.speed()), (1.0, 1.0));
+}
+
+#[test]
+fn at_double_speed_an_audio_file_runs_twice_as_fast_as_at_normal_speed_and_ends_at_3_s() {
+    let s = start();
+
+    let (wall_1x, moved_1x, ended_1x) = play_a_fresh_copy_of_sine_at(&s, 1.0);
+    let (wall_2x, moved_2x, ended_2x) = play_a_fresh_copy_of_sine_at(&s, 2.0);
+    let end_2x = s.player.shared.position();
+
+    assert_eq!((ended_1x.error, ended_2x.error), (None, None));
+    assert!((2.9..=3.3).contains(&end_2x), "position at the end is {end_2x}, the file is 3 s long");
+    let (rate_1x, rate_2x) = (moved_1x / wall_1x, moved_2x / wall_2x);
+    let ratio = rate_2x / rate_1x;
+    assert!(
+        (1.7..=2.3).contains(&ratio),
+        "2x moved {moved_2x:.3} s in {wall_2x:.3} s, 1x moved {moved_1x:.3} s in {wall_1x:.3} s: ratio {ratio:.2}"
+    );
+}
+
 #[test]
 fn audio_file_reports_duration_seeks_and_ends() {
     let s = start();

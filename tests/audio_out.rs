@@ -257,6 +257,207 @@ mod render {
     }
 }
 
+mod speed {
+    use super::*;
+
+    const RATE: u32 = 8000;
+
+    macro_rules! expect {
+        ($bad:ident, $cond:expr, $($arg:tt)+) => {
+            if !$cond {
+                $bad.push(format!($($arg)+));
+            }
+        };
+    }
+
+    fn finish(bad: Vec<String>) {
+        assert!(bad.is_empty(), "{} expectation(s) failed:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    fn stereo_index_ramp(frames: usize) -> Vec<f32> {
+        (0..frames).flat_map(|i| [i as f32, -(i as f32)]).collect()
+    }
+
+    fn tone(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|i| {
+                let t = i as f32 / RATE as f32;
+                [0.5 * (std::f32::consts::TAU * 440.0 * t).sin(), 0.25 * (std::f32::consts::TAU * 330.0 * t).sin()]
+            })
+            .collect()
+    }
+
+    fn stereo_8k() -> AudioShared {
+        let shared = AudioShared::default();
+        shared.set_format(RATE, 2);
+        shared
+    }
+
+    fn played_frames(shared: &AudioShared) -> u64 {
+        (shared.played_secs() * RATE as f64).round() as u64
+    }
+
+    #[test]
+    fn set_speed_keeps_positive_finite_speeds_and_turns_anything_else_into_1() {
+        let cases = [(0.5, 0.5), (2.0, 2.0), (3.0, 3.0), (1.0, 1.0), (0.0, 1.0), (-1.5, 1.0), (f64::NAN, 1.0), (f64::INFINITY, 1.0)];
+        let shared = AudioShared::default();
+        assert_eq!(shared.speed(), 1.0, "default");
+        for (set, expected) in cases {
+            shared.set_speed(set);
+            assert_eq!(shared.speed(), expected, "set_speed({set})");
+        }
+    }
+
+    #[test]
+    fn the_clock_counts_media_time_and_the_buffer_only_what_is_still_to_play() {
+        let mut bad = Vec::new();
+        for speed in [0.5, 1.5, 2.0] {
+            let shared = stereo_8k();
+            shared.set_speed(speed);
+            let pushed = 8000u64;
+            shared.push(&tone(pushed as usize));
+            let mut out = [0f32; 2 * 160];
+            let mut out_frames = 0u64;
+            for call in 0..20 {
+                shared.render(&mut out);
+                out_frames += 160;
+                let (played, buffered) = (played_frames(&shared), shared.buffered_frames() as u64);
+                expect!(bad, played + buffered == pushed, "speed {speed}, call {call}: played {played} + buffered {buffered} != pushed {pushed}");
+            }
+            let played = played_frames(&shared) as f64;
+            let expected = out_frames as f64 * speed;
+            let one_stretch_step = 96.0 * speed + 1.0;
+            expect!(bad, (played - expected).abs() <= one_stretch_step, "speed {speed}: clock at {played} frames after {out_frames} out, expected {expected}");
+        }
+        finish(bad);
+    }
+
+    #[test]
+    fn volume_scales_the_stretched_sound() {
+        let full = stereo_8k();
+        let half = stereo_8k();
+        for shared in [&full, &half] {
+            shared.set_speed(1.25);
+            shared.push(&tone(4000));
+        }
+        half.set_volume(0.5);
+        let (mut a, mut b) = ([0f32; 640], [0f32; 640]);
+
+        full.render(&mut a);
+        half.render(&mut b);
+
+        assert!(a.iter().any(|s| s.abs() > 0.1), "the stretched output is not silent");
+        let scaled: Vec<f32> = a.iter().map(|s| s * 0.5).collect();
+        assert_eq!(b.to_vec(), scaled);
+        assert_eq!(played_frames(&full), played_frames(&half));
+    }
+
+    #[test]
+    fn muted_at_speed_is_silence_with_the_clock_running_and_paused_stops_both() {
+        let loud = stereo_8k();
+        let muted = stereo_8k();
+        let paused = stereo_8k();
+        for shared in [&loud, &muted, &paused] {
+            shared.set_speed(2.0);
+            shared.push(&tone(4000));
+        }
+        muted.set_muted(true);
+        paused.set_paused(true);
+        let (mut a, mut b, mut c) = ([0f32; 640], [9f32; 640], [9f32; 640]);
+
+        loud.render(&mut a);
+        muted.render(&mut b);
+        paused.render(&mut c);
+
+        assert_eq!(b, [0.0; 640]);
+        assert_eq!(c, [0.0; 640]);
+        assert!(played_frames(&loud) > 0);
+        assert_eq!(played_frames(&muted), played_frames(&loud));
+        assert_eq!((played_frames(&paused), paused.buffered_frames()), (0, 4000));
+    }
+
+    #[test]
+    fn free_run_advances_the_clock_by_the_callback_times_the_speed() {
+        let cases = [(2.0, 10, 0, 20), (0.75, 12, 0, 9), (1.5, 100, 0, 150), (2.0, 300, 4000, 600), (0.5, 300, 4000, 150)];
+        let mut bad = Vec::new();
+        for (speed, frames, queued, expected) in cases {
+            let shared = stereo_8k();
+            shared.set_speed(speed);
+            shared.set_free_run(true);
+            shared.push(&tone(queued));
+            let mut out = vec![0f32; 2 * frames];
+            shared.render(&mut out);
+            let played = played_frames(&shared);
+            expect!(bad, played == expected, "speed {speed}, {frames} frames, {queued} queued: clock {played}, expected {expected}");
+        }
+        finish(bad);
+    }
+
+    #[test]
+    fn back_at_speed_1_the_queue_plays_on_exactly_from_the_first_frame_not_yet_played() {
+        let shared = stereo_8k();
+        let pushed = 20_000;
+        shared.push(&stereo_index_ramp(pushed));
+        shared.set_speed(1.5);
+        let mut out = [0f32; 2 * 128];
+        for _ in 0..10 {
+            shared.render(&mut out);
+        }
+
+        shared.set_speed(1.0);
+        let mut exact_from = None;
+        for call in 0..30 {
+            let before = played_frames(&shared);
+            shared.render(&mut out);
+            let expected: Vec<f32> = stereo_index_ramp(pushed)[2 * before as usize..2 * (before as usize + 128)].to_vec();
+            if out.to_vec() == expected {
+                exact_from.get_or_insert(call);
+            } else {
+                assert!(exact_from.is_none(), "call {call}: plain playback stopped again: {:?}", &out[..8]);
+            }
+            assert_eq!(played_frames(&shared) + shared.buffered_frames() as u64, pushed as u64, "call {call}");
+        }
+
+        assert!(exact_from.is_some_and(|c| c < 10), "plain playback resumed at call {exact_from:?}");
+    }
+
+    #[test]
+    fn the_end_of_the_queue_is_played_to_an_empty_buffer_at_every_speed() {
+        let mut bad = Vec::new();
+        for speed in [0.5, 1.0, 1.5, 2.0] {
+            let shared = stereo_8k();
+            shared.set_speed(speed);
+            let pushed = 1000u64;
+            shared.push(&tone(pushed as usize));
+            let mut out = [0f32; 2 * 160];
+            for _ in 0..100 {
+                shared.render(&mut out);
+            }
+            let (played, buffered) = (played_frames(&shared), shared.buffered_frames());
+            expect!(bad, (played, buffered) == (pushed, 0), "speed {speed}: played {played}, still buffered {buffered}, expected {pushed} and 0");
+        }
+        finish(bad);
+    }
+
+    #[test]
+    fn reset_at_speed_forgets_the_stretch() {
+        let shared = stereo_8k();
+        shared.set_speed(2.0);
+        shared.push(&tone(4000));
+        let mut out = [0f32; 640];
+        shared.render(&mut out);
+
+        shared.reset();
+        shared.set_speed(1.0);
+        shared.push(&stereo_index_ramp(10));
+        let mut plain = [9f32; 8];
+        shared.render(&mut plain);
+
+        assert_eq!(plain, [0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+        assert_eq!((played_frames(&shared), shared.buffered_frames()), (4, 6));
+    }
+}
+
 mod mix {
     use super::*;
 

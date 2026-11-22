@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,10 +14,13 @@ use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::codecs::registry::CodecRegistry;
 
 use crate::audio_out::{AudioOut, AudioShared};
+use crate::cookies::{self, CookieJar};
 use crate::demux::{self, Demuxer};
 use crate::media::{AudioPacket, AudioTrack, MediaInfo, Packet, VideoFrame, VideoTrack, trim_decoded};
 use crate::net;
+use crate::spotify::{self, Playlist};
 use crate::vdec::{self, VideoDecoder};
+use crate::youtube::{self, Choice, Video};
 
 /// Decoded pictures held ready for display. Small on purpose: a 1080p frame is 3 MB.
 pub const FRAME_QUEUE: usize = 6;
@@ -38,6 +41,9 @@ const ALIGN_TOLERANCE_SECS: f64 = 0.01;
 const AUDIO_FAILURES_BEFORE_NOTE: u32 = 50;
 /// How many times a lost output device is reopened before audio is given up.
 const MAX_DEVICE_REOPENS: u32 = 5;
+const YOUTUBE_CACHE_FOR: Duration = Duration::from_secs(3600);
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum State {
@@ -64,6 +70,10 @@ pub struct Status {
     pub info: String,
     pub error: Option<String>,
     pub notes: Vec<String>,
+    pub youtube: Option<Arc<Video>>,
+    pub choice: Choice,
+    pub playlist: Option<Arc<Playlist>>,
+    pub entry: usize,
 }
 
 struct Clock {
@@ -71,6 +81,7 @@ struct Clock {
     use_audio: bool,
     wall_accum: f64,
     wall_anchor: Option<Instant>,
+    speed: f64,
 }
 
 pub struct Shared {
@@ -83,6 +94,12 @@ pub struct Shared {
     /// Abort flag of the session being opened or played; lets the UI thread cut short a
     /// stalled network read that the pipeline thread is blocked in.
     abort: Mutex<Arc<AtomicBool>>,
+    youtube_cache: Mutex<Option<(String, Instant, Arc<Video>)>>,
+    youtube_audio_only: AtomicBool,
+    spotify_cache: Mutex<Option<(String, Instant, Arc<Playlist>)>>,
+    spotify_next: Mutex<Option<(String, usize, Instant, Arc<Video>)>>,
+    skipped: Mutex<Vec<String>>,
+    cookies: Mutex<Option<(PathBuf, Arc<CookieJar>)>>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -92,9 +109,15 @@ impl Shared {
             audio: Arc::new(AudioShared::default()),
             frames: Mutex::new(VecDeque::new()),
             status: Mutex::new(Status::default()),
-            clock: Mutex::new(Clock { base: 0.0, use_audio: false, wall_accum: 0.0, wall_anchor: None }),
+            clock: Mutex::new(Clock { base: 0.0, use_audio: false, wall_accum: 0.0, wall_anchor: None, speed: 1.0 }),
             force_show: AtomicBool::new(false),
             abort: Mutex::new(Arc::new(AtomicBool::new(false))),
+            youtube_cache: Mutex::new(None),
+            youtube_audio_only: AtomicBool::new(false),
+            spotify_cache: Mutex::new(None),
+            spotify_next: Mutex::new(None),
+            skipped: Mutex::new(Vec::new()),
+            cookies: Mutex::new(None),
             repaint,
         }
     }
@@ -130,7 +153,7 @@ impl Shared {
         if c.use_audio {
             c.base + self.audio.played_secs()
         } else {
-            c.base + c.wall_accum + c.wall_anchor.map_or(0.0, |t| t.elapsed().as_secs_f64())
+            c.base + c.wall_accum + c.wall_anchor.map_or(0.0, |t| t.elapsed().as_secs_f64() * c.speed)
         }
     }
 
@@ -143,11 +166,38 @@ impl Shared {
         let mut c = self.clock.lock().unwrap();
         if paused {
             if let Some(t) = c.wall_anchor.take() {
-                c.wall_accum += t.elapsed().as_secs_f64();
+                c.wall_accum += t.elapsed().as_secs_f64() * c.speed;
             }
         } else if c.wall_anchor.is_none() {
             c.wall_anchor = Some(Instant::now());
         }
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.clock.lock().unwrap().speed
+    }
+
+    pub fn youtube_audio_only(&self) -> bool {
+        self.youtube_audio_only.load(Ordering::Relaxed)
+    }
+
+    pub fn cookies_path(&self) -> Option<PathBuf> {
+        self.cookies.lock().unwrap().as_ref().map(|(p, _)| p.clone())
+    }
+
+    fn cookie_jar(&self) -> Option<Arc<CookieJar>> {
+        self.cookies.lock().unwrap().as_ref().map(|(_, j)| j.clone())
+    }
+
+    pub fn set_speed(&self, speed: f64) {
+        let speed = if speed.is_finite() { speed.clamp(MIN_SPEED, MAX_SPEED) } else { 1.0 };
+        let mut c = self.clock.lock().unwrap();
+        if let Some(t) = c.wall_anchor {
+            c.wall_accum += t.elapsed().as_secs_f64() * c.speed;
+            c.wall_anchor = Some(Instant::now());
+        }
+        c.speed = speed;
+        self.audio.set_speed(speed);
     }
 
     fn restart_clock(&self, base: f64, use_audio: Option<bool>) {
@@ -210,7 +260,7 @@ impl Shared {
 }
 
 enum Cmd {
-    Open(String),
+    Open(String, Option<Choice>, Option<usize>),
     Seek(f64),
     Stop,
     Quit,
@@ -239,7 +289,39 @@ impl Player {
     pub fn open(&self, target: impl Into<String>) {
         // Whatever is playing is about to be replaced; do not let a stalled stream delay that.
         self.shared.abort_current();
-        let _ = self.tx.send(Cmd::Open(target.into()));
+        let _ = self.tx.send(Cmd::Open(target.into(), None, None));
+    }
+
+    pub fn open_youtube(&self, target: impl Into<String>, choice: Choice) {
+        self.shared.abort_current();
+        let _ = self.tx.send(Cmd::Open(target.into(), Some(choice), None));
+    }
+
+    pub fn open_entry(&self, target: impl Into<String>, index: usize) {
+        self.shared.abort_current();
+        let _ = self.tx.send(Cmd::Open(target.into(), None, Some(index)));
+    }
+
+    pub fn set_cookies(&self, path: Option<PathBuf>) -> Result<usize, String> {
+        let Some(path) = path else {
+            *self.shared.cookies.lock().unwrap() = None;
+            let forgotten = cookies::save_path(None);
+            let removed = cookies::remove_ytdlp_copy();
+            return forgotten.and(removed).map(|_| 0);
+        };
+        let jar = cookies::load(&path)?;
+        let count = jar.cookies.len();
+        *self.shared.cookies.lock().unwrap() = Some((path.clone(), Arc::new(jar)));
+        cookies::save_path(Some(&path))?;
+        Ok(count)
+    }
+
+    pub fn set_speed(&self, speed: f64) {
+        self.shared.set_speed(speed);
+    }
+
+    pub fn set_youtube_audio_only(&self, on: bool) {
+        self.shared.youtube_audio_only.store(on, Ordering::Relaxed);
     }
 
     pub fn seek(&self, secs: f64) {
@@ -286,6 +368,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     // this media, not the pipeline thread (which would leave the UI dead).
                     Err(TryRecvError::Empty) => match catch_unwind(AssertUnwindSafe(|| s.step(&shared))) {
                         Ok(true) => None,
+                        Ok(false) if s.finished && s.advance.is_some() => {
+                            if let Some(e) = shared.status().error.filter(|_| shared.status().state == State::Failed) {
+                                shared.skipped.lock().unwrap().push(format!("the previous entry broke off: {e}"));
+                            }
+                            s.advance.take().map(|(target, index)| Cmd::Open(target, None, Some(index)))
+                        }
                         Ok(false) => match rx.recv_timeout(s.idle_wait(&shared)) {
                             Ok(c) => Some(c),
                             Err(RecvTimeoutError::Timeout) => None,
@@ -301,7 +389,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             },
         };
         match cmd {
-            Some(Cmd::Open(mut target)) => {
+            Some(Cmd::Open(mut target, mut choice, mut entry)) => {
                 // Opening can block on the network for many seconds; if the user has already
                 // asked for something else, do not make them wait for this one first.
                 // A seek belongs to whatever was opened before it, so only one that follows
@@ -309,8 +397,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 let mut seek_after = None;
                 loop {
                     match rx.try_recv() {
-                        Ok(Cmd::Open(newer)) => {
+                        Ok(Cmd::Open(newer, newer_choice, newer_entry)) => {
                             target = newer;
+                            choice = newer_choice;
+                            entry = newer_entry;
                             seek_after = None;
                         }
                         Ok(Cmd::Seek(to)) => seek_after = Some(to),
@@ -327,10 +417,25 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 // Drop the old session first so its device and download are released.
                 session = None;
                 begin_loading(&shared, &target);
-                match catch_unwind(AssertUnwindSafe(|| Session::open(&shared, &target))) {
+                let opened = catch_unwind(AssertUnwindSafe(|| Session::open(&shared, &target, choice.as_ref(), entry)));
+                let failed = !matches!(opened, Ok(Ok(_)));
+                let failed_title = spotify_entry_label(&shared, &target, entry).unwrap_or_else(|| shared.status().title);
+                match opened {
                     Ok(Ok(s)) => session = Some(s),
                     Ok(Err(e)) => shared.fail(e),
                     Err(_) => shared.fail("cannot open: internal error while reading the file".into()),
+                }
+                let aborted = shared.abort.lock().unwrap().load(Ordering::Relaxed);
+                if failed
+                    && !aborted
+                    && !matches!(queued, Some(Cmd::Stop | Cmd::Quit))
+                    && let Some(next) = next_entry(&shared, &target, entry)
+                {
+                    let why = shared.status().error.unwrap_or_default();
+                    shared.skipped.lock().unwrap().push(format!("skipped {}: {why}", failed_title.trim_end_matches('…')));
+                    queued = Some(Cmd::Open(target.clone(), None, Some(next)));
+                } else if !failed {
+                    shared.skipped.lock().unwrap().clear();
                 }
             }
             Some(Cmd::Seek(mut to)) => {
@@ -381,6 +486,61 @@ fn display_name(target: &str) -> String {
         return target.to_string();
     }
     Path::new(target).file_name().and_then(|n| n.to_str()).unwrap_or(target).to_string()
+}
+
+fn spotify_entry_label(shared: &Shared, target: &str, entry: Option<usize>) -> Option<String> {
+    let cache = shared.spotify_cache.lock().unwrap();
+    let (url, _, list) = cache.as_ref()?;
+    (url == target).then(|| list.entries.get(entry.unwrap_or(0)).map(|e| e.label()))?
+}
+
+fn next_entry(shared: &Shared, target: &str, entry: Option<usize>) -> Option<usize> {
+    let cache = shared.spotify_cache.lock().unwrap();
+    let (url, _, list) = cache.as_ref()?;
+    let next = entry.unwrap_or(0) + 1;
+    (url == target && next < list.entries.len()).then_some(next)
+}
+
+fn resolve_spotify(shared: &Arc<Shared>, url: &str) -> Result<Arc<Playlist>, String> {
+    if let Some((cached, at, list)) = shared.spotify_cache.lock().unwrap().as_ref()
+        && cached == url
+        && at.elapsed() < YOUTUBE_CACHE_FOR
+    {
+        return Ok(list.clone());
+    }
+    shared.update_status(|st| st.title = "Reading the Spotify list…".to_string());
+    let list = Arc::new(spotify::fetch(url, shared.cookie_jar().as_deref())?);
+    *shared.spotify_cache.lock().unwrap() = Some((url.to_string(), Instant::now(), list.clone()));
+    Ok(list)
+}
+
+fn prefetch_entry(shared: &Arc<Shared>, target: String, list: Arc<Playlist>, index: usize, abort: Arc<AtomicBool>) {
+    let Some(item) = list.entries.get(index).cloned() else { return };
+    let shared = shared.clone();
+    std::thread::spawn(move || {
+        let quiet = |_: &str| {};
+        let Ok(found) = youtube::search(&item.query(), item.duration, &abort, &quiet) else { return };
+        let Ok(video) = youtube::resolve(&found, ytdlp_cookies(&shared).as_deref(), &abort, &quiet) else { return };
+        *shared.spotify_next.lock().unwrap() = Some((target, index, Instant::now(), Arc::new(video)));
+    });
+}
+
+fn ytdlp_cookies(shared: &Shared) -> Option<PathBuf> {
+    cookies::ytdlp_copy(&*shared.cookie_jar()?)
+}
+
+fn resolve_youtube(shared: &Arc<Shared>, url: &str, abort: &Arc<AtomicBool>) -> Result<Arc<Video>, String> {
+    let id = youtube::video_id(url).unwrap_or_default();
+    if let Some((cached, at, video)) = shared.youtube_cache.lock().unwrap().as_ref()
+        && *cached == id
+        && at.elapsed() < YOUTUBE_CACHE_FOR
+    {
+        return Ok(video.clone());
+    }
+    let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
+    let video = Arc::new(youtube::resolve(url, ytdlp_cookies(shared).as_deref(), abort, &progress)?);
+    *shared.youtube_cache.lock().unwrap() = Some((id, Instant::now(), video.clone()));
+    Ok(video)
 }
 
 /// Symphonia's own decoders plus the pure-Rust Opus decoder it does not ship.
@@ -507,6 +667,7 @@ struct Session {
     /// The demuxer error that ended reading, kept to report a file that never played at all.
     read_error: Option<String>,
     abort: Arc<AtomicBool>,
+    advance: Option<(String, usize)>,
 }
 
 impl Drop for Session {
@@ -516,7 +677,7 @@ impl Drop for Session {
 }
 
 impl Session {
-    fn open(shared: &Arc<Shared>, target: &str) -> Result<Self, String> {
+    fn open(shared: &Arc<Shared>, target: &str, choice: Option<&Choice>, entry: Option<usize>) -> Result<Self, String> {
         let abort = Arc::new(AtomicBool::new(false));
         *shared.abort.lock().unwrap() = abort.clone();
         let mut target = target.trim().to_string();
@@ -532,7 +693,48 @@ impl Session {
         let mut title = display_name(&target);
         let live = net::is_url(&target);
         let mut finite = false;
-        let demux: Box<dyn Demuxer> = if live {
+        let mut video_info = None;
+        let mut chosen = Choice::default();
+        let mut playlist = None;
+        let demux: Box<dyn Demuxer> = if spotify::is_spotify_url(&target) {
+            let list = resolve_spotify(shared, &target)?;
+            let index = entry.unwrap_or(0).min(list.entries.len().saturating_sub(1));
+            let item = list.entries.get(index).cloned().ok_or("this Spotify list is empty")?;
+            shared.update_status(|st| {
+                st.title = format!("Finding \u{201c}{}\u{201d} on YouTube…", item.label());
+                st.playlist = Some(list.clone());
+                st.entry = index;
+            });
+            let prefetched = shared
+                .spotify_next
+                .lock()
+                .unwrap()
+                .take()
+                .filter(|(url, i, at, _)| *url == target && *i == index && at.elapsed() < YOUTUBE_CACHE_FOR)
+                .map(|(_, _, _, video)| video);
+            let video = match prefetched {
+                Some(video) => video,
+                None => {
+                    let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
+                    let found = youtube::search(&item.query(), item.duration, &abort, &progress)?;
+                    resolve_youtube(shared, &found, &abort)?
+                }
+            };
+            let opened = youtube::open(&video, &Choice::default(), true, abort.clone())?;
+            title = item.label();
+            finite = true;
+            playlist = Some((list, index));
+            opened.demuxer
+        } else if youtube::is_youtube_url(&target) {
+            let video = resolve_youtube(shared, &target, &abort)?;
+            let audio_only = shared.youtube_audio_only();
+            let opened = youtube::open(&video, choice.unwrap_or(&Choice::default()), audio_only, abort.clone())?;
+            title = video.title.clone();
+            finite = true;
+            chosen = opened.choice;
+            video_info = Some(video);
+            opened.demuxer
+        } else if live {
             let cb_shared = shared.clone();
             let stream = net::open_url(
                 &target,
@@ -550,6 +752,7 @@ impl Session {
 
         let info = demux.info().clone();
         let mut notes = info.notes.clone();
+        notes.append(&mut shared.skipped.lock().unwrap());
         let mut vdec = None;
         if let Some(track) = &info.video {
             match vdec::make_decoder(track) {
@@ -578,10 +781,25 @@ impl Session {
         }
 
         let seekable = info.seekable && info.duration.is_some();
+        if !seekable {
+            shared.set_speed(1.0);
+        }
         let vtrack = info.video.clone().filter(|_| vdec.is_some());
-        let mut summary = info.container.clone();
+        let mut summary = if video_info.is_some() { "YouTube".to_string() } else { info.container.clone() };
         if let Some(t) = &vtrack {
             summary.push_str(&format!(" · {} {}×{}", t.codec.name(), t.width, t.height));
+        } else if video_info.is_some() {
+            summary.push_str(" · sound only");
+        }
+        if let Some((list, index)) = &playlist {
+            summary = format!("Spotify · {} · {}/{} · sound from YouTube", list.name, index + 1, list.entries.len());
+        }
+        let advance = playlist
+            .as_ref()
+            .filter(|(list, index)| index + 1 < list.entries.len())
+            .map(|(_, index)| (target.clone(), index + 1));
+        if let (Some((list, _)), Some((_, next))) = (&playlist, &advance) {
+            prefetch_entry(shared, target.clone(), list.clone(), *next, abort.clone());
         }
         shared.restart_clock(0.0, Some(adec.is_some()));
         shared.force_show.store(true, Ordering::Relaxed);
@@ -595,6 +813,10 @@ impl Session {
             st.has_audio = adec.is_some();
             st.info = summary;
             st.notes = notes;
+            st.youtube = video_info;
+            st.choice = chosen;
+            st.playlist = playlist.as_ref().map(|(list, _)| list.clone());
+            st.entry = playlist.as_ref().map_or(0, |(_, index)| *index);
         });
 
         Ok(Self {
@@ -628,6 +850,7 @@ impl Session {
             audio_written: false,
             read_error: None,
             abort,
+            advance,
         })
     }
 

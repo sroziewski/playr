@@ -3,6 +3,7 @@
 
 pub mod avi;
 pub mod http;
+pub mod range_http;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

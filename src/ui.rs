@@ -1,17 +1,23 @@
 //! The window: video surface, overlay controls, keyboard shortcuts, drag-and-drop.
 
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, Key, RichText, ViewportCommand};
 use eframe::egui_glow;
 
-use crate::controls::{self, DEFAULT_STEP, Icon, SKIP_STEPS, Shortcut, SkipChain, icon_button, skip_label, step_label};
+use crate::cookies;
+use crate::controls::{
+    self, DEFAULT_STEP, Icon, SKIP_STEPS, SPEEDS, Shortcut, SkipChain, icon_button, skip_label, speed_label, step_label,
+};
 use crate::media::format_time;
 use crate::net;
 use crate::player::{Player, State, Status};
 use crate::radio::{self, Station};
+use crate::subtitles::Subtitles;
 use crate::video_gl::VideoRenderer;
+use crate::youtube::{self, Caption, CaptionKind, Choice, Video};
 
 /// File types the open dialog offers. The installers in `install/` register playr for exactly
 /// these with the desktop ("Open with"); `tests/installers.rs` keeps the lists equal.
@@ -36,12 +42,25 @@ pub struct App {
     skip_chain: SkipChain,
     osd: Option<(String, Instant)>,
     radio_query: String,
+    captions: Captions,
+    cookie_note: Option<String>,
+}
+
+#[derive(Default)]
+struct Captions {
+    track: Option<Caption>,
+    last: Option<Caption>,
+    loaded: Option<Subtitles>,
+    pending: Option<Receiver<Result<Subtitles, String>>>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<String>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let player = Player::new(Box::new(move || ctx.request_repaint()));
+        if let Some(saved) = cookies::saved_path() {
+            let _ = player.set_cookies(Some(saved));
+        }
         if let Some(target) = initial {
             player.open(target);
         }
@@ -60,6 +79,8 @@ impl App {
             skip_chain: SkipChain::default(),
             osd: None,
             radio_query: String::new(),
+            captions: Captions::default(),
+            cookie_note: None,
         }
     }
 
@@ -93,6 +114,156 @@ impl App {
         self.osd = Some((format!("Skip step: {}", step_label(SKIP_STEPS[self.skip_step])), Instant::now()));
     }
 
+    fn browse_cookies(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose a cookies file (Netscape cookies.txt format)")
+            .add_filter("Cookies (Netscape format)", &["txt"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        if let Some(path) = picked {
+            let note = match self.player.set_cookies(Some(path.clone())) {
+                Ok(n) => format!("Using {n} cookies from {}", path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned())),
+                Err(e) => format!("Not a cookies file: {e}"),
+            };
+            self.show_osd(note.clone());
+            self.cookie_note = Some(note);
+        }
+    }
+
+    fn forget_cookies(&mut self) {
+        let note = match self.player.set_cookies(None) {
+            Ok(_) => "No cookies file".to_string(),
+            Err(e) => format!("Could not forget the cookies file: {e}"),
+        };
+        self.show_osd(note.clone());
+        self.cookie_note = Some(note);
+    }
+
+    fn cookie_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let current = self.player.shared.cookies_path();
+            let name = current.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned());
+            ui.label(format!("🍪 Cookies: {}", name.as_deref().unwrap_or("none")))
+                .on_hover_text("A Netscape cookies.txt file exported from your browser. Only its spotify.com cookies go to Spotify and only its youtube.com / google.com cookies to YouTube.");
+            if ui.button("Browse…").clicked() {
+                self.browse_cookies();
+            }
+            if current.is_some() && ui.button("Forget").clicked() {
+                self.forget_cookies();
+            }
+        });
+        if let Some(note) = &self.cookie_note {
+            ui.weak(note);
+        }
+    }
+
+    fn playlist_controls(&mut self, ui: &mut egui::Ui, status: &Status) {
+        let Some(list) = status.playlist.clone() else { return };
+        let count = list.entries.len();
+        let at = status.entry.min(count.saturating_sub(1));
+        if ui.add_enabled(at > 0, egui::Button::new("⏮")).on_hover_text("Previous in the list").clicked() {
+            self.player.open_entry(status.source.clone(), at - 1);
+        }
+        ui.menu_button(format!("📃 {}/{}", at + 1, count), |ui| {
+            ui.strong(&list.name);
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                for (i, item) in list.entries.iter().enumerate() {
+                    let label = format!("{}. {}", i + 1, item.label());
+                    if ui.add(egui::Button::selectable(i == at, label)).clicked() && i != at {
+                        self.player.open_entry(status.source.clone(), i);
+                        ui.close();
+                    }
+                }
+            });
+        })
+        .response
+        .on_hover_text("Spotify list (played from YouTube, sound only)");
+        if ui.add_enabled(at + 1 < count, egui::Button::new("⏭")).on_hover_text("Next in the list").clicked() {
+            self.player.open_entry(status.source.clone(), at + 1);
+        }
+    }
+
+    fn show_osd(&mut self, text: impl Into<String>) {
+        self.osd = Some((text.into(), Instant::now()));
+    }
+
+    fn set_speed(&mut self, speed: f64) {
+        self.player.set_speed(speed);
+        self.show_osd(format!("Speed {}", speed_label(self.player.shared.speed())));
+    }
+
+    fn reopen_youtube(&mut self, status: &Status, choice: Choice, what: &str) {
+        let position = self.player.shared.position();
+        self.player.open_youtube(status.source.clone(), choice);
+        self.player.seek(position);
+        self.show_osd(format!("Switching to {what}…"));
+    }
+
+    fn select_caption(&mut self, ctx: &egui::Context, caption: Option<Caption>, headers: Vec<(String, String)>) {
+        self.captions.loaded = None;
+        self.captions.pending = None;
+        if let Some(track) = self.captions.track.take() {
+            self.captions.last = Some(track);
+        }
+        let Some(caption) = caption else {
+            self.show_osd("Captions off");
+            return;
+        };
+        let (tx, rx) = channel();
+        let fetched = caption.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(youtube::fetch_caption(&fetched, &headers));
+            repaint.request_repaint();
+        });
+        self.show_osd(format!("Captions: {}", caption.label));
+        self.captions.track = Some(caption);
+        self.captions.pending = Some(rx);
+    }
+
+    fn toggle_captions(&mut self, ctx: &egui::Context, status: &Status) {
+        if self.captions.track.is_some() {
+            self.select_caption(ctx, None, Vec::new());
+            return;
+        }
+        let Some(video) = &status.youtube else {
+            self.show_osd("No captions for this media");
+            return;
+        };
+        let language = video.pick(&status.choice).1.and_then(|a| a.language.clone());
+        let caption = self.captions.last.clone().or_else(|| video.default_caption(language.as_deref()).cloned());
+        match caption {
+            Some(c) => self.select_caption(ctx, Some(c), video.headers.clone()),
+            None => self.show_osd("This video has no captions"),
+        }
+    }
+
+    fn poll_captions(&mut self) {
+        let Some(rx) = &self.captions.pending else { return };
+        match rx.try_recv() {
+            Ok(Ok(subs)) => {
+                self.captions.loaded = Some(subs);
+                self.captions.pending = None;
+            }
+            Ok(Err(e)) => {
+                self.captions.pending = None;
+                self.captions.track = None;
+                self.show_osd(format!("Captions unavailable: {e}"));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.captions.pending = None,
+        }
+    }
+
+    fn open_pasted(&mut self, text: &str) {
+        if let Some(target) = controls::pasted_target(text) {
+            self.player.open(target);
+        } else {
+            self.show_osd("The clipboard holds no address or file to play");
+        }
+    }
+
     fn toggle_fullscreen(ctx: &egui::Context) {
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
@@ -111,6 +282,15 @@ impl App {
             return;
         }
         let text_focused = ctx.text_edit_focused();
+        let pasted = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        if let Some(text) = pasted.filter(|_| !text_focused) {
+            self.open_pasted(&text);
+        }
         let keys: Vec<Key> = ctx.input(|i| {
             i.events
                 .iter()
@@ -142,11 +322,15 @@ impl App {
                         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
                     }
                 }
+                Shortcut::Slower if status.seekable => self.set_speed(controls::speed_after(self.player.shared.speed(), -1)),
+                Shortcut::Faster if status.seekable => self.set_speed(controls::speed_after(self.player.shared.speed(), 1)),
+                Shortcut::Slower | Shortcut::Faster => {}
+                Shortcut::ToggleCaptions => self.toggle_captions(ctx, status),
             }
         }
     }
 
-    fn draw_stage(&mut self, ui: &mut egui::Ui, status: &Status) {
+    fn draw_stage(&mut self, ui: &mut egui::Ui, status: &Status, controls_shown: bool) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         let response = ui.interact(rect, ui.scope_id().with("stage"), egui::Sense::click());
@@ -193,7 +377,29 @@ impl App {
             let galley = ui.painter().text(egui::pos2(rect.left() + 12.0, y), Align2::LEFT_TOP, text, egui::FontId::proportional(13.0), color);
             y += galley.height() + 4.0;
         }
+        if status.state == State::Playing || status.state == State::Ended {
+            self.draw_captions(ui, rect, controls_shown);
+        }
         self.draw_osd(ui, rect);
+    }
+
+    fn draw_captions(&self, ui: &mut egui::Ui, rect: egui::Rect, controls_shown: bool) {
+        let Some(subs) = &self.captions.loaded else { return };
+        let lines = subs.lines_at(self.player.shared.position());
+        if lines.is_empty() {
+            return;
+        }
+        let painter = ui.painter();
+        let font = egui::FontId::proportional((rect.height() * 0.045).clamp(16.0, 44.0));
+        let mut bottom = rect.bottom() - if controls_shown { 96.0 } else { 36.0 };
+        for line in lines.iter().rev() {
+            let galley = painter.layout(line.to_string(), font.clone(), Color32::WHITE, rect.width() * 0.9);
+            let size = galley.size();
+            let top_left = egui::pos2(rect.center().x - size.x / 2.0, bottom - size.y);
+            painter.rect_filled(egui::Rect::from_min_size(top_left, size).expand2(egui::vec2(8.0, 2.0)), 4.0, Color32::from_black_alpha(185));
+            painter.galley(top_left, galley, Color32::WHITE);
+            bottom -= size.y + 4.0;
+        }
     }
 
     fn draw_osd(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -303,11 +509,38 @@ impl App {
             if ui.button("Open").on_hover_text("Open a file (O)").clicked() {
                 self.open_dialog();
             }
-            if ui.button("URL").on_hover_text("Open an address (U)").clicked() {
+            if ui.button("URL").on_hover_text("Open an address: YouTube, Spotify, radio, file (U)").clicked() {
                 self.url_open = true;
+            }
+            let cookie_tip = match self.player.shared.cookies_path() {
+                Some(p) => format!("Cookies file: {}\nClick to choose another", p.display()),
+                None => "Choose a browser cookies file (Netscape cookies.txt) for Spotify and YouTube".to_string(),
+            };
+            if ui.button("🍪").on_hover_text(cookie_tip).clicked() {
+                self.browse_cookies();
             }
             let radio_label = if radio::find_by_url(&status.source).is_some() { "📻 Radio ●" } else { "📻 Radio" };
             ui.menu_button(radio_label, |ui| self.radio_menu(ui, status));
+            ui.separator();
+            let speed = shared.speed();
+            ui.add_enabled_ui(status.seekable, |ui| {
+                ui.menu_button(speed_label(speed), |ui| {
+                    for s in SPEEDS {
+                        let label = if s == 1.0 { "1× (normal)".to_string() } else { speed_label(s) };
+                        if ui.add(egui::Button::selectable((s - speed).abs() < 1e-9, label)).clicked() {
+                            self.set_speed(s);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Playback speed (< and >)")
+                .on_disabled_hover_text(controls::no_skip_reason(status.live));
+            });
+            if let Some(video) = status.youtube.clone() {
+                self.youtube_menus(ui, ctx, status, &video);
+            }
+            self.playlist_controls(ui, status);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             let (icon, tip) = if fullscreen {
                 (Icon::ExitFullscreen, "Exit full screen (F12, F, Esc)")
@@ -325,6 +558,88 @@ impl App {
             };
             ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
         });
+    }
+
+    fn youtube_menus(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status, video: &Video) {
+        let (current_video, current_audio) = video.pick(&status.choice);
+        let mut audio_only = self.player.shared.youtube_audio_only();
+        let tick = ui
+            .checkbox(&mut audio_only, "🎧 Audio only")
+            .on_hover_text("Play YouTube as sound only, like radio: no picture is downloaded or decoded");
+        if tick.changed() {
+            self.player.set_youtube_audio_only(audio_only);
+            let what = if audio_only { "sound only" } else { "video and sound" };
+            self.reopen_youtube(status, status.choice.clone(), what);
+        }
+        if !video.video.is_empty() && !audio_only {
+            let label = current_video.map_or_else(|| "Quality".to_string(), |f| format!("⚙ {}", f.label()));
+            ui.menu_button(label, |ui| {
+                for format in &video.video {
+                    let selected = current_video.is_some_and(|c| c.id == format.id);
+                    if ui.add(egui::Button::selectable(selected, format.label())).clicked() && !selected {
+                        let choice = Choice { video: Some(format.id.clone()), ..status.choice.clone() };
+                        self.reopen_youtube(status, choice, &format.label());
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Picture quality");
+        }
+        if video.audio.len() > 1 {
+            let label = current_audio.map_or_else(|| "Audio".to_string(), |a| format!("🗣 {}", a.language.clone().unwrap_or_else(|| a.label.clone())));
+            ui.menu_button(label, |ui| {
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for track in &video.audio {
+                        let selected = current_audio.is_some_and(|c| c.id == track.id);
+                        if ui.add(egui::Button::selectable(selected, &track.label)).clicked() && !selected {
+                            let choice = Choice { audio: Some(track.id.clone()), ..status.choice.clone() };
+                            self.reopen_youtube(status, choice, &track.label);
+                            ui.close();
+                        }
+                    }
+                });
+            })
+            .response
+            .on_hover_text("Audio track");
+        }
+        let on = self.captions.track.is_some();
+        let cc = if on { "CC ●" } else { "CC" };
+        ui.menu_button(cc, |ui| {
+            if video.captions.is_empty() {
+                ui.weak("This video has no captions");
+                return;
+            }
+            if ui.add(egui::Button::selectable(!on, "Off")).clicked() {
+                self.select_caption(ctx, None, Vec::new());
+                ui.close();
+            }
+            let current = self.captions.track.as_ref().map(|c| c.code.clone());
+            let mut picked = None;
+            for caption in video.captions.iter().filter(|c| c.kind != CaptionKind::Translated) {
+                if ui.add(egui::Button::selectable(current.as_deref() == Some(&caption.code), &caption.label)).clicked() {
+                    picked = Some(caption.clone());
+                }
+            }
+            let translated: Vec<&Caption> = video.captions.iter().filter(|c| c.kind == CaptionKind::Translated).collect();
+            if !translated.is_empty() {
+                ui.menu_button("Auto-translate", |ui| {
+                    egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                        for caption in translated {
+                            if ui.add(egui::Button::selectable(current.as_deref() == Some(&caption.code), &caption.label)).clicked() {
+                                picked = Some(caption.clone());
+                            }
+                        }
+                    });
+                });
+            }
+            if let Some(caption) = picked {
+                self.select_caption(ctx, Some(caption), video.headers.clone());
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Subtitles / captions (C)");
     }
 
     fn radio_menu(&mut self, ui: &mut egui::Ui, status: &Status) {
@@ -382,13 +697,15 @@ impl App {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label("Radio stream, playlist (.m3u / .pls) or media file address:");
-                let edit = ui.add(egui::TextEdit::singleline(&mut self.url_text).desired_width(420.0).hint_text("https://…"));
+                ui.label("YouTube or Spotify link, radio stream, playlist (.m3u / .pls) or media file address:");
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.url_text).desired_width(420.0).hint_text("https://…   (Ctrl+V to paste)"));
                 edit.request_focus();
                 let enter = ui.input(|i| i.key_pressed(Key::Enter));
                 ui.horizontal(|ui| {
                     submit = ui.button("Play").clicked() || enter;
                 });
+                ui.separator();
+                self.cookie_row(ui);
             });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             open = false;
@@ -415,7 +732,9 @@ impl eframe::App for App {
             self.frame_size = None;
             self.renderer.lock().unwrap().clear();
             self.skip_chain.reset();
+            self.captions = Captions::default();
         }
+        self.poll_captions();
         let title = if status.title.is_empty() { "playr".to_string() } else { format!("{} — playr", status.title) };
         if title != self.last_title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
@@ -433,17 +752,18 @@ impl eframe::App for App {
         if playing {
             // Wake exactly when the next picture is due; with no picture queued, the pipeline
             // wakes us, and the slow tick only keeps the time display moving.
-            let wait = next_in.unwrap_or(0.25).clamp(0.001, 0.25);
+            let wait = (next_in.unwrap_or(0.25) / shared.speed()).clamp(0.001, 0.25);
             ctx.request_repaint_after(Duration::from_secs_f64(wait));
         }
-
-        self.draw_stage(ui, &status);
 
         let idle = self.last_motion.elapsed();
         // Never hide the controls from under a slider being dragged or an open menu.
         let interacting = self.seek_drag.is_some() || ctx.egui_is_using_pointer() || ctx.any_popup_open();
         let auto_hide = status.video.is_some() && playing && !self.url_open && !interacting;
-        if !auto_hide || idle < CONTROLS_HIDE_AFTER {
+        let controls_shown = !auto_hide || idle < CONTROLS_HIDE_AFTER;
+        self.draw_stage(ui, &status, controls_shown);
+
+        if controls_shown {
             let position = match status.duration {
                 Some(d) => shared.position().clamp(0.0, d),
                 None => shared.position().max(0.0),

@@ -47,6 +47,8 @@ Run ((Video 4) + (Sine 4) + @('-c:v', 'libx265', '-preset', 'veryfast', '-pix_fm
 Run ((Video 4) + (Sine 4) + $x264 + @('-x264-params', 'open-gop=1:keyint=25:min-keyint=25:scenecut=0') + $aac + $bitexact + "$here\h264_opengop_aac.mp4")
 # The index (moov) in front of the media data, so a cut-off copy still opens.
 Run ((Video 4) + (Sine 4) + $x264 + @('-bf', '0', '-g', '25', '-movflags', '+faststart') + $aac + $bitexact + "$here\h264_faststart_aac.mp4")
+Run ((Video 12 '160x120') + $x264 + @('-bf', '0', '-g', '50', '-keyint_min', '50', '-sc_threshold', '0', '-an', '-movflags', '+dash+global_sidx') + $bitexact + "$here\dash_video.mp4")
+Run ((Sine 12) + $aac + @('-vn', '-frag_duration', '3000000', '-movflags', '+dash+global_sidx') + $bitexact + "$here\dash_audio.m4a")
 Run ((Video 2) + (Sine 2) + $x264 + @('-c:a', 'libvorbis', '-ac', '2') + $bitexact + "$here\h264_vorbis.mkv")
 Run ((Video 2) + (Sine 2) + @('-c:v', 'libx265', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-x265-params', 'log-level=error', '-c:a', 'libvorbis', '-ac', '2') + $bitexact + "$here\hevc_vorbis.mkv")
 Run ((Video 2) + (Sine 2) + @('-c:v', 'libx265', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-x265-params', 'log-level=error:info=0', '-tag:v', 'hvc1') + $aac + $bitexact + "$here\hevc_aac.mp4")

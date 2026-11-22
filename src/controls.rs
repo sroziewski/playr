@@ -12,6 +12,34 @@ pub const DEFAULT_STEP: usize = 2;
 /// Skips this close together add up (see [`SkipChain`]).
 pub const CHAIN_WINDOW: Duration = Duration::from_millis(1500);
 
+pub const SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+pub fn speed_label(speed: f64) -> String {
+    format!("{}×", (speed * 100.0).round() / 100.0)
+}
+
+pub fn speed_after(current: f64, delta: isize) -> f64 {
+    const EPS: f64 = 1e-9;
+    let mut speed = current;
+    for _ in 0..delta.unsigned_abs() {
+        let next = if delta > 0 {
+            SPEEDS.iter().copied().find(|&s| s > speed + EPS)
+        } else {
+            SPEEDS.iter().rev().copied().find(|&s| s < speed - EPS)
+        };
+        match next {
+            Some(s) => speed = s,
+            None => break,
+        }
+    }
+    if delta == 0 { current } else { speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]) }
+}
+
+pub fn pasted_target(text: &str) -> Option<String> {
+    let text = text.trim().trim_matches('"').trim();
+    (!text.is_empty() && (crate::net::is_url(text) || std::path::Path::new(text).is_file())).then(|| text.to_string())
+}
+
 /// "10 s", "1 min", "10 min".
 pub fn step_label(secs: f64) -> String {
     if secs >= 60.0 && secs % 60.0 == 0.0 { format!("{} min", secs as u64 / 60) } else { format!("{} s", secs as u64) }
@@ -48,6 +76,9 @@ pub enum Shortcut {
     OpenUrl,
     ToggleFullscreen,
     LeaveFullscreen,
+    Slower,
+    Faster,
+    ToggleCaptions,
 }
 
 /// The shortcut bound to `key`. While a text field has focus the keys belong to the text
@@ -69,6 +100,9 @@ pub fn shortcut(key: Key, text_field_focused: bool) -> Option<Shortcut> {
         Key::U => Shortcut::OpenUrl,
         Key::F | Key::F12 => Shortcut::ToggleFullscreen,
         Key::Escape => Shortcut::LeaveFullscreen,
+        Key::Comma => Shortcut::Slower,
+        Key::Period => Shortcut::Faster,
+        Key::C => Shortcut::ToggleCaptions,
         _ => return None,
     })
 }
