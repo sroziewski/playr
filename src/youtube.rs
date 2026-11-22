@@ -559,14 +559,31 @@ pub fn parse_search(json: &str) -> Result<Vec<(String, Option<f64>)>, String> {
 
 /// Finds `query` on YouTube and returns the watch address of the best match for a recording
 /// `expected` seconds long.
-pub fn search(query: &str, expected: Option<f64>, abort: &AtomicBool, progress: &dyn Fn(&str)) -> Result<String, String> {
+pub fn search(queries: &[String], expected: Option<f64>, abort: &AtomicBool, progress: &dyn Fn(&str)) -> Result<String, String> {
     let exe = ytdlp_candidates(progress).into_iter().next().map(|(exe, _)| exe).ok_or("searching YouTube needs yt-dlp, which could not be downloaded")?;
-    let search = format!("ytsearch5:{query}");
-    let args = ["-J", "--flat-playlist", "--no-warnings", "--no-progress", "--", search.as_str()];
-    let results = parse_search(&run_quiet(&exe, &args, YTDLP_TIMEOUT, abort)?)?;
-    let lengths: Vec<Option<f64>> = results.iter().map(|r| r.1).collect();
-    let best = pick_search_result(&lengths, expected).ok_or_else(|| format!("nothing found on YouTube for \u{201c}{query}\u{201d}"))?;
-    Ok(format!("https://www.youtube.com/watch?v={}", results[best].0))
+    let mut fallback = None;
+    for query in queries {
+        let search = format!("ytsearch5:{query}");
+        let args = ["-J", "--flat-playlist", "--no-warnings", "--no-progress", "--", search.as_str()];
+        let results = match run_quiet(&exe, &args, YTDLP_TIMEOUT, abort).and_then(|json| parse_search(&json)) {
+            Ok(results) => results,
+            Err(_) if fallback.is_some() && !abort.load(Ordering::Relaxed) => break,
+            Err(e) => return Err(e),
+        };
+        let lengths: Vec<Option<f64>> = results.iter().map(|r| r.1).collect();
+        let Some(best) = pick_search_result(&lengths, expected) else { continue };
+        let url = format!("https://www.youtube.com/watch?v={}", results[best].0);
+        let fits = match (expected, lengths[best]) {
+            (Some(want), Some(got)) => (got - want).abs() <= duration_tolerance(want),
+            _ => true,
+        };
+        if fits {
+            return Ok(url);
+        }
+        fallback.get_or_insert(url);
+    }
+    let first = queries.first().map_or("", String::as_str);
+    fallback.ok_or_else(|| format!("nothing found on YouTube for \u{201c}{first}\u{201d}"))
 }
 
 /// The yt-dlp executables to try, best first, each flagged when it is playr's own copy (which

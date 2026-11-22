@@ -4,7 +4,7 @@
 mod common;
 
 use common::finish;
-use playr::spotify::{Entry, Kind, Playlist, parse_embed, parse_url};
+use playr::spotify::{Entry, Kind, Playlist, parse_embed, parse_url, shorten_title};
 use serde_json::{Value, json};
 
 const ID: &str = "37i9dQZF1DXcBWIGoYBM5M";
@@ -74,7 +74,7 @@ fn page(entity: Option<Value>) -> String {
 }
 
 fn entry(title: &str, subtitle: &str, duration: Option<f64>) -> Entry {
-    Entry { title: title.into(), subtitle: subtitle.into(), duration }
+    Entry { title: title.into(), subtitle: subtitle.into(), duration, audio: None }
 }
 
 mod embed_page {
@@ -106,6 +106,7 @@ mod embed_page {
                     entry("Song C", "Sub", Some(2.5)),
                     entry("Song D", "", None),
                 ],
+                start: 0,
             }
         );
     }
@@ -116,7 +117,7 @@ mod embed_page {
 
         let list = parse_embed(&page(Some(entity))).expect("parse");
 
-        assert_eq!(list, Playlist { name: "Episode 7".into(), entries: vec![entry("Episode 7", "The Show", Some(3600.5))] });
+        assert_eq!(list, Playlist { name: "Episode 7".into(), entries: vec![entry("Episode 7", "The Show", Some(3600.5))], start: 0 });
     }
 
     #[test]
@@ -165,6 +166,53 @@ fn entry_query_and_label_put_artist_and_title_together() {
     assert_eq!(song.label(), "Jóga — Björk");
     assert_eq!(untitled_artist.query(), "Lonely Title");
     assert_eq!(untitled_artist.label(), "Lonely Title");
+}
+
+mod search_queries {
+    use super::*;
+
+    #[test]
+    fn shorten_title_drops_bracketed_parts_and_everything_from_the_first_bar() {
+        let cases = [
+            ("bracket and bar", "[Łagodny początek] LIST DO ŚWIĘTEGO MIKOŁAJA 2 | Wyciszająca bajka", "LIST DO ŚWIĘTEGO MIKOŁAJA 2"),
+            ("nested brackets", "Bajka [o [smoku] i] zamku", "Bajka zamku"),
+            ("two bracketed parts", "[S01] Odcinek [HD] pierwszy", "Odcinek pierwszy"),
+            ("only the first bar counts", "Kołysanka | część 1 | część 2", "Kołysanka"),
+            ("whitespace collapsed", "  Cicha\t  noc  ", "Cicha noc"),
+            ("nothing to drop", "Jóga", "Jóga"),
+            ("only a bracket", "[Zwiastun]", ""),
+            ("bar first", "| Wyciszająca bajka", ""),
+            ("bar inside brackets", "[a|b] Title", "Title"),
+            ("empty", "", ""),
+        ];
+        let mut bad = Vec::new();
+        for (case, title, expected) in cases {
+            let actual = shorten_title(title);
+            expect!(bad, actual == expected, "{case}: shorten_title({title:?}) = {actual:?}, expected {expected:?}");
+        }
+        finish(bad);
+    }
+
+    #[test]
+    fn queries_go_from_the_full_query_to_the_short_show_and_title_without_repeats_or_a_bare_title() {
+        let long = "[Łagodny początek] LIST DO ŚWIĘTEGO MIKOŁAJA 2 | Wyciszająca bajka";
+        let show = "Zosia Cebulka - bajki do snu i zabawy";
+        let cases: [(&str, Entry, Vec<String>); 7] = [
+            ("long podcast title", entry(long, show, Some(862.0)), vec![format!("{show} {long}"), "Zosia Cebulka LIST DO ŚWIĘTEGO MIKOŁAJA 2".into()]),
+            ("plain song", entry("Jóga", "Björk", Some(305.0)), vec!["Björk Jóga".into()]),
+            ("artist with a dash, plain title", entry("Jóga", "Björk - Live", Some(305.0)), vec!["Björk - Live Jóga".into(), "Björk Jóga".into()]),
+            ("dash only in the show", entry("Odcinek 3", "Radio - Rano - Wieczór", None), vec!["Radio - Rano - Wieczór Odcinek 3".into(), "Radio Odcinek 3".into()]),
+            ("no subtitle", entry("Lonely Title", "", None), vec!["Lonely Title".into()]),
+            ("no subtitle, long title", entry("[Zwiastun] Lonely Title | odcinek 1", "", None), vec!["[Zwiastun] Lonely Title | odcinek 1".into(), "Lonely Title".into()]),
+            ("title is only a bracket", entry("[Zwiastun]", "Pora na bajkę", None), vec!["Pora na bajkę [Zwiastun]".into(), "Pora na bajkę".into()]),
+        ];
+        let mut bad = Vec::new();
+        for (case, e, expected) in cases {
+            let actual = e.queries();
+            expect!(bad, actual == expected, "{case}: {actual:?}\n    expected {expected:?}");
+        }
+        finish(bad);
+    }
 }
 
 #[test]

@@ -9,6 +9,7 @@
 use serde_json::Value;
 
 use crate::cookies::CookieJar;
+use crate::podcast;
 
 /// Where the embed pages are fetched from; the variable [`EMBED_ENV`] points it elsewhere
 /// (a mirror, or a local server in tests).
@@ -80,6 +81,7 @@ pub struct Entry {
     pub subtitle: String,
     /// Seconds, as Spotify gives it; used to pick the right recording on YouTube.
     pub duration: Option<f64>,
+    pub audio: Option<String>,
 }
 
 impl Entry {
@@ -88,16 +90,44 @@ impl Entry {
         if self.subtitle.is_empty() { self.title.clone() } else { format!("{} {}", self.subtitle, self.title) }
     }
 
+    pub fn queries(&self) -> Vec<String> {
+        let short_title = shorten_title(&self.title);
+        let short_subtitle = self.subtitle.split(" - ").next().unwrap_or("").trim().to_string();
+        let mut list = vec![self.query()];
+        let shorter = if short_subtitle.is_empty() { short_title } else { format!("{short_subtitle} {short_title}") };
+        let shorter = shorter.trim().to_string();
+        if !shorter.is_empty() && !list.contains(&shorter) {
+            list.push(shorter);
+        }
+        list
+    }
+
     /// "Title — Artist".
     pub fn label(&self) -> String {
         if self.subtitle.is_empty() { self.title.clone() } else { format!("{} — {}", self.title, self.subtitle) }
     }
 }
 
+pub fn shorten_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for c in title.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    let head = out.split('|').next().unwrap_or("");
+    head.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Playlist {
     pub name: String,
     pub entries: Vec<Entry>,
+    pub start: usize,
 }
 
 fn text(v: &Value, key: &str) -> Option<String> {
@@ -114,7 +144,7 @@ fn entry(v: &Value) -> Option<Entry> {
         })
         .unwrap_or_default();
     let duration = v.get("duration").and_then(Value::as_f64).filter(|d| *d > 0.0).map(|ms| ms / 1000.0);
-    Some(Entry { title, subtitle, duration })
+    Some(Entry { title, subtitle, duration, audio: None })
 }
 
 /// Reads the list out of a Spotify embed page (the JSON its `__NEXT_DATA__` script carries).
@@ -134,7 +164,7 @@ pub fn parse_embed(html: &str) -> Result<Playlist, String> {
     if entries.is_empty() {
         return Err("this Spotify list is empty".into());
     }
-    Ok(Playlist { name, entries })
+    Ok(Playlist { name, entries, start: 0 })
 }
 
 /// Fetches the list behind a Spotify link. Cookies for spotify.com, if given, go along with
@@ -147,5 +177,33 @@ pub fn fetch(url: &str, cookies: Option<&CookieJar>) -> Result<Playlist, String>
     if let Some(header) = cookies.and_then(|jar| jar.header_for(&embed, crate::cookies::now_unix())) {
         headers.push(("Cookie".to_string(), header));
     }
-    parse_embed(&crate::dash::get_text(&embed, &headers, 8 << 20)?)
+    let mut list = parse_embed(&crate::dash::get_text(&embed, &headers, 8 << 20)?)?;
+    if matches!(kind, Kind::Show | Kind::Episode) {
+        if let Some(feed) = from_feed(&list, kind) {
+            return Ok(feed);
+        }
+        if kind == Kind::Show && !list.entries[0].subtitle.is_empty() {
+            list.name = list.entries[0].subtitle.clone();
+        }
+    }
+    Ok(list)
+}
+
+fn from_feed(embed: &Playlist, kind: Kind) -> Option<Playlist> {
+    let first = embed.entries.first()?;
+    let show = first.subtitle.trim();
+    if show.is_empty() {
+        return None;
+    }
+    let feed = podcast::fetch_feed(&podcast::find_feed(show).ok()??).ok()?;
+    let start = match kind {
+        Kind::Episode => podcast::find_episode(&feed, &first.title)?,
+        _ => 0,
+    };
+    let entries = feed
+        .episodes
+        .into_iter()
+        .map(|e| Entry { title: e.title, subtitle: show.to_string(), duration: e.duration, audio: Some(e.audio) })
+        .collect();
+    Some(Playlist { name: show.to_string(), entries, start })
 }

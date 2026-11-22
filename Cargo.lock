@@ -2271,6 +2271,7 @@ dependencies = [
  "eframe",
  "embed-resource",
  "oxideav-mpeg4video",
+ "quick-xml",
  "rfd",
  "rust_h264",
  "rust_h265",

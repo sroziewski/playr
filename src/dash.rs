@@ -92,7 +92,8 @@ fn short(url: &str) -> &str {
 /// A remote file read with HTTP `Range` requests.
 pub struct HttpFetch {
     agent: ureq::Agent,
-    url: String,
+    url: std::sync::Mutex<String>,
+    origin: String,
     headers: Vec<(String, String)>,
     len: u64,
 }
@@ -100,8 +101,9 @@ pub struct HttpFetch {
 impl HttpFetch {
     /// Connects and reads the first `head` bytes, which also reveals the file's length.
     pub fn connect(url: &str, headers: &[(String, String)], head: u64) -> Result<(Self, Vec<u8>), String> {
-        let mut fetch = Self { agent: agent(), url: url.to_string(), headers: headers.to_vec(), len: 0 };
-        let resp = fetch.request(0, head)?;
+        let mut fetch =
+            Self { agent: agent(), url: std::sync::Mutex::new(url.to_string()), origin: url.to_string(), headers: headers.to_vec(), len: 0 };
+        let resp = fetch.request_at(url, 0, head)?;
         let total = resp
             .headers()
             .get("content-range")
@@ -109,6 +111,7 @@ impl HttpFetch {
             .and_then(content_range_total)
             .ok_or_else(|| format!("{} does not support ranged downloads", short(url)))?;
         fetch.len = total;
+        *fetch.url.lock().unwrap() = ureq::ResponseExt::get_uri(&resp).to_string();
         let mut bytes = Vec::new();
         resp.into_body()
             .into_reader()
@@ -119,13 +122,25 @@ impl HttpFetch {
     }
 
     fn request(&self, from: u64, to: u64) -> Result<ureq::http::Response<ureq::Body>, String> {
-        let mut req = self.agent.get(&self.url).header("Range", format!("bytes={from}-{}", to.saturating_sub(1)));
+        let cached = self.url.lock().unwrap().clone();
+        match self.request_at(&cached, from, to) {
+            Err(_) if cached != self.origin => {
+                let resp = self.request_at(&self.origin, from, to)?;
+                *self.url.lock().unwrap() = ureq::ResponseExt::get_uri(&resp).to_string();
+                Ok(resp)
+            }
+            result => result,
+        }
+    }
+
+    fn request_at(&self, url: &str, from: u64, to: u64) -> Result<ureq::http::Response<ureq::Body>, String> {
+        let mut req = self.agent.get(url).header("Range", format!("bytes={from}-{}", to.saturating_sub(1)));
         for (name, value) in &self.headers {
             req = req.header(name.as_str(), value.as_str());
         }
-        let resp = req.call().map_err(|e| format!("cannot download {}: {e}", short(&self.url)))?;
+        let resp = req.call().map_err(|e| format!("cannot download {}: {e}", short(&self.origin)))?;
         if resp.status().as_u16() != 206 {
-            return Err(format!("{} ignored the byte range (HTTP {})", short(&self.url), resp.status().as_u16()));
+            return Err(format!("{} ignored the byte range (HTTP {})", short(&self.origin), resp.status().as_u16()));
         }
         Ok(resp)
     }

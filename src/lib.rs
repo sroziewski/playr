@@ -16,6 +16,7 @@ pub mod media;
 pub mod mp4_hvcc;
 pub mod net;
 pub mod player;
+pub mod podcast;
 pub mod radio;
 pub mod spotify;
 pub mod stretch;

@@ -190,6 +190,7 @@ pub struct SymDemuxer {
     nominal_frames: f64,
     /// Packets already read while checking where a seek really landed.
     peeked: VecDeque<Packet>,
+    seek_mode: SeekMode,
 }
 
 /// How far before the landing point packets may legitimately sit right after a seek
@@ -299,6 +300,7 @@ impl SymDemuxer {
             audio_rate,
             nominal_frames: 0.0,
             peeked: VecDeque::new(),
+            seek_mode: SeekMode::Accurate,
         })
     }
 
@@ -310,12 +312,17 @@ impl SymDemuxer {
         Ok(())
     }
 
+    pub fn with_coarse_seeking(mut self) -> Self {
+        self.seek_mode = SeekMode::Coarse;
+        self
+    }
+
     fn try_seek(&mut self, secs: f64) -> Result<f64, String> {
         let track = self.video.or(self.audio);
         let time = Time::try_from_secs_f64(secs).ok_or("seek position out of range")?;
         let to = self
             .fmt
-            .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: track.map(|t| t.0) })
+            .seek(self.seek_mode, SeekTo::Time { time, track_id: track.map(|t| t.0) })
             .map_err(|e| format!("seek failed: {e}"))?;
         let tb = [self.video, self.audio].into_iter().flatten().find(|t| t.0 == to.track_id).and_then(|t| t.1);
         Ok(ts_secs(tb, to.actual_ts))

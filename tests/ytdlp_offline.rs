@@ -126,6 +126,10 @@ extern "C" fn act_as_fake_ytdlp() {
     }
     let last = args.last().cloned().unwrap_or_default();
     if let Some(query) = last.strip_prefix("ytsearch5:") {
+        if script["fail"].as_array().is_some_and(|fail| fail.iter().any(|q| q == query)) {
+            eprintln!("ERROR: [youtube:search] {query}: search refused");
+            std::process::exit(1);
+        }
         let entries = script["search"].get(query).cloned().unwrap_or(serde_json::json!([]));
         println!("{}", serde_json::json!({ "entries": entries }));
         std::process::exit(0);
@@ -657,4 +661,316 @@ fn a_spotify_list_plays_on_to_the_next_entry_and_skips_one_youtube_refuses_with_
     assert!(searched.contains(&"Artist Two Title Two"), "{searched:?}");
     let asked = |id: &str| calls.iter().filter(|c| c.starts_with("-J ") && c.contains(id)).count();
     assert_eq!((asked("AAAAAAAAAA1"), asked("CCCCCCCCCC3")), (1, 1));
+}
+
+fn search_call(query: &str) -> String {
+    format!("-J --flat-playlist --no-warnings --no-progress -- ytsearch5:{query}")
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn youtube_search_tries_the_queries_in_order_until_one_finds_a_result_of_the_right_length() {
+    let test = "youtube_search_tries_the_queries_in_order_until_one_finds_a_result_of_the_right_length";
+    if !is_child() {
+        let dir = fresh_dir("search_queries");
+        let hit = |id: &str, secs: f64| serde_json::json!([{ "id": id, "duration": secs }]);
+        let script = serde_json::json!({ "search": {
+            "a full": [], "a short": hit("A2short0000", 300.0),
+            "b full": hit("B1toolong00", 900.0), "b short": hit("B2fits00000", 310.0),
+            "c full": hit("C1toolong00", 900.0), "c short": hit("C2toolong00", 950.0), "c shortest": [],
+            "d full": [], "d short": [], "d shortest": [],
+            "e full": hit("E1anylen000", 900.0), "e short": hit("E2unused000", 300.0),
+            "f full": hit("F1toolong00", 900.0), "f shortest": hit("F3unused000", 300.0),
+            "g full": [{ "id": "G1nolength0" }], "g short": hit("G3unused000", 300.0),
+            "h short": hit("H2unused000", 300.0),
+        }, "fail": ["f short", "h full"] });
+        let mut env = private_env(&dir);
+        env.push(("PLAYR_YTDLP", install_exe_fake(&dir.join("fake"), &script).into_os_string()));
+        run_child(test, env);
+        return;
+    }
+    let fake = test_dir().join("fake");
+    let watch = |id: &str| Ok(format!("https://www.youtube.com/watch?v={id}"));
+    let cases: [(&str, Option<f64>, Result<String, String>, &[&str]); 8] = [
+        ("full finds nothing", Some(300.0), watch("A2short0000"), &["a full", "a short"]),
+        ("full finds the wrong length", Some(300.0), watch("B2fits00000"), &["b full", "b short"]),
+        ("nothing fits", Some(300.0), watch("C1toolong00"), &["c full", "c short", "c shortest"]),
+        ("nothing at all", Some(300.0), Err("nothing found on YouTube for \u{201c}d full\u{201d}".into()), &["d full", "d short", "d shortest"]),
+        ("no expected length", None, watch("E1anylen000"), &["e full"]),
+        ("a later query fails after a wrong length", Some(300.0), watch("F1toolong00"), &["f full", "f short"]),
+        ("unknown length", Some(300.0), watch("G1nolength0"), &["g full"]),
+        ("the first query fails", Some(300.0), Err("[youtube:search] h full: search refused".into()), &["h full"]),
+    ];
+    let mut bad = Vec::new();
+    for (case, expected_secs, expected, searched) in cases {
+        let prefix = &searched[0][..2];
+        let queries: Vec<String> = ["full", "short", "shortest"].iter().map(|q| format!("{prefix}{q}")).collect();
+        let before = calls(&fake).len();
+        let actual = playr::youtube::search(&queries, expected_secs, &AtomicBool::new(false), &|_: &str| {});
+        let made: Vec<String> = calls(&fake)[before..].to_vec();
+        let wanted: Vec<String> = searched.iter().map(|q| search_call(q)).collect();
+        expect!(bad, actual == expected, "{case}: {actual:?}, expected {expected:?}");
+        expect!(bad, made == wanted, "{case}: searched {made:?}\n    expected {wanted:?}");
+    }
+    common::finish(bad);
+}
+
+const PODCAST_SHOW: &str = "Zosia Cebulka - bajki do snu i zabawy";
+const PODCAST_LONG_TITLE: &str = "[Łagodny początek] LIST DO ŚWIĘTEGO MIKOŁAJA 2 | Wyciszająca bajka";
+
+fn episode_embed_page(title: &str, subtitle: &str, duration_ms: u64) -> Vec<u8> {
+    let entity = serde_json::json!({ "type": "episode", "title": title, "subtitle": subtitle, "duration": duration_ms });
+    let data = serde_json::json!({ "props": { "pageProps": { "state": { "data": { "entity": entity } } } } });
+    format!("<html><body><script id=\"__NEXT_DATA__\" type=\"application/json\">{data}</script></body></html>").into_bytes()
+}
+
+struct PodcastSite {
+    audio: RangeServer,
+    feed: RangeServer,
+    spotify: RangeServer,
+}
+
+impl PodcastSite {
+    fn start(embed_path: &str, embed: Vec<u8>, show_in_directory: &str) -> Self {
+        Self::start_with(embed_path, embed, show_in_directory, [None, None, None])
+    }
+
+    fn start_with(embed_path: &str, embed: Vec<u8>, show_in_directory: &str, enclosures: [Option<String>; 3]) -> Self {
+        let audio = RangeServer::start(vec![
+            ("/ep/a.mp3", Mode::Ranged, fixture_bytes("sine.mp3")),
+            ("/ep/b.mp3", Mode::Ranged, fixture_bytes("sine.mp3")),
+            ("/ep/c.mp3", Mode::Ranged, fixture_bytes("radio.mp3")),
+            ("/a.m4a", Mode::Ranged, fixture_bytes("dash_audio.m4a")),
+        ]);
+        let rss = format!(
+            r#"<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel><title>Feed name</title>
+<item><title>Pierwsza bajka</title><enclosure url="{}" type="audio/mpeg"/><itunes:duration>3</itunes:duration></item>
+<item><title>Bajka o smoku, część 2</title><enclosure url="{}" type="audio/mpeg"/><itunes:duration>00:00:03</itunes:duration></item>
+<item><title>Kołysanka</title><enclosure url="{}" type="audio/mpeg"/><itunes:duration>4</itunes:duration></item>
+</channel></rss>"#,
+            enclosures[0].clone().unwrap_or_else(|| audio.url("/ep/a.mp3")),
+            enclosures[1].clone().unwrap_or_else(|| audio.url("/ep/b.mp3")),
+            enclosures[2].clone().unwrap_or_else(|| audio.url("/ep/c.mp3"))
+        );
+        let feed = RangeServer::start(vec![("/feed.xml", Mode::IgnoresRange, rss.into_bytes())]);
+        let answer = serde_json::json!({ "resultCount": 1, "results": [
+            { "kind": "podcast", "collectionName": show_in_directory, "feedUrl": feed.url("/feed.xml") },
+        ]});
+        let spotify = RangeServer::start(vec![
+            (embed_path, Mode::IgnoresRange, embed),
+            ("/search", Mode::IgnoresRange, answer.to_string().into_bytes()),
+        ]);
+        Self { audio, feed, spotify }
+    }
+
+    fn env(&self, dir: &Path, script: &serde_json::Value) -> Vec<(&'static str, OsString)> {
+        let mut env = private_env(dir);
+        env.push(("PLAYR_YTDLP", install_exe_fake(&dir.join("fake"), script).into_os_string()));
+        env.push((playr::spotify::EMBED_ENV, OsString::from(self.spotify.url("/embed"))));
+        env.push((playr::podcast::SEARCH_ENV, OsString::from(self.spotify.url("/search"))));
+        env
+    }
+}
+
+fn play_entries_until(player: &Player, link: &str, last: usize) -> Vec<Status> {
+    player.open(link);
+    let mut played: Vec<Status> = Vec::new();
+    wait_for_status(player, "the last entry to play", |s| {
+        if s.state == State::Playing && s.source == link && played.last().map(|p| p.entry) != Some(s.entry) {
+            played.push(s.clone());
+        }
+        s.state == State::Playing && s.entry == last
+    });
+    player.stop();
+    played
+}
+
+fn synthetic_cookie_file() -> PathBuf {
+    let path = test_dir().join("cookies.txt");
+    std::fs::write(&path, "127.0.0.1\tFALSE\t/\tFALSE\t0\tsp_dc\tsynthetic-not-a-secret\n").unwrap();
+    path
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn a_spotify_show_plays_its_feed_episodes_in_order_seekably_without_ytdlp_or_cookies_off_spotify() {
+    let test = "a_spotify_show_plays_its_feed_episodes_in_order_seekably_without_ytdlp_or_cookies_off_spotify";
+    if !is_child() {
+        let dir = fresh_dir("podcast_show");
+        let site = PodcastSite::start("/embed/show/033OZDMSatg3WCetEI9bge", episode_embed_page("Kołysanka", PODCAST_SHOW, 4_000), PODCAST_SHOW);
+        run_child(test, site.env(&dir, &serde_json::json!({})));
+        assert_eq!(calls(&dir.join("fake")), Vec::<String>::new());
+        let embed_cookie = site.spotify.requests().iter().find(|r| r.path.starts_with("/embed/")).map(|r| r.header("cookie").map(str::to_string));
+        assert_eq!(embed_cookie, Some(Some("sp_dc=synthetic-not-a-secret".to_string())));
+        let off_spotify: Vec<_> = [site.audio.requests(), site.feed.requests(), site.spotify.requests().into_iter().filter(|r| r.path.starts_with("/search")).collect()].concat();
+        assert!(off_spotify.iter().any(|r| r.path == "/ep/b.mp3"), "{off_spotify:?}");
+        let with_cookie: Vec<&str> = off_spotify.iter().filter(|r| r.header("cookie").is_some()).map(|r| r.path.as_str()).collect();
+        assert_eq!(with_cookie, Vec::<&str>::new());
+        return;
+    }
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+    player.set_speed(2.0);
+    player.set_cookies(Some(synthetic_cookie_file())).unwrap();
+
+    let played = play_entries_until(&player, "https://open.spotify.com/show/033OZDMSatg3WCetEI9bge", 1);
+
+    let seen: Vec<(usize, &str, &str, bool)> = played.iter().map(|s| (s.entry, s.title.as_str(), s.info.as_str(), s.seekable)).collect();
+    assert_eq!(
+        seen,
+        [
+            (0, "Pierwsza bajka — Zosia Cebulka - bajki do snu i zabawy", "Spotify · Zosia Cebulka - bajki do snu i zabawy · 1/3 · podcast feed", true),
+            (1, "Bajka o smoku, część 2 — Zosia Cebulka - bajki do snu i zabawy", "Spotify · Zosia Cebulka - bajki do snu i zabawy · 2/3 · podcast feed", true),
+        ]
+    );
+    assert_eq!(played[1].notes, Vec::<String>::new());
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn a_spotify_episode_link_starts_at_that_episode_of_the_feed_and_plays_on_to_the_next() {
+    let test = "a_spotify_episode_link_starts_at_that_episode_of_the_feed_and_plays_on_to_the_next";
+    if !is_child() {
+        let dir = fresh_dir("podcast_episode");
+        let page = episode_embed_page("BAJKA O SMOKU – część 2!", PODCAST_SHOW, 3_000);
+        let site = PodcastSite::start("/embed/episode/4kGynGaUBQwwRI3xTvpDPN", page, PODCAST_SHOW);
+        run_child(test, site.env(&dir, &serde_json::json!({})));
+        assert_eq!(calls(&dir.join("fake")), Vec::<String>::new());
+        let requested: Vec<String> = site.audio.requests().iter().map(|r| r.path.clone()).collect();
+        assert!(!requested.is_empty());
+        assert!(!requested.iter().any(|p| p == "/ep/a.mp3"), "{requested:?}");
+        return;
+    }
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+    player.set_speed(2.0);
+
+    let played = play_entries_until(&player, "https://open.spotify.com/episode/4kGynGaUBQwwRI3xTvpDPN", 2);
+
+    let seen: Vec<(usize, &str)> = played.iter().map(|s| (s.entry, s.info.as_str())).collect();
+    assert_eq!(
+        seen,
+        [
+            (1, "Spotify · Zosia Cebulka - bajki do snu i zabawy · 2/3 · podcast feed"),
+            (2, "Spotify · Zosia Cebulka - bajki do snu i zabawy · 3/3 · podcast feed"),
+        ]
+    );
+    assert_eq!(played[1].title, "Kołysanka — Zosia Cebulka - bajki do snu i zabawy");
+    assert_eq!(played[0].playlist.as_ref().map(|p| p.start), Some(1));
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn a_spotify_show_missing_from_the_directory_plays_from_youtube_found_by_a_shorter_query() {
+    let test = "a_spotify_show_missing_from_the_directory_plays_from_youtube_found_by_a_shorter_query";
+    let short = "Zosia Cebulka LIST DO ŚWIĘTEGO MIKOŁAJA 2";
+    if !is_child() {
+        let dir = fresh_dir("podcast_fallback");
+        let page = episode_embed_page(PODCAST_LONG_TITLE, PODCAST_SHOW, 12_000);
+        let site = PodcastSite::start("/embed/show/033OZDMSatg3WCetEI9bge", page, "Zosia Cebulka");
+        let script = serde_json::json!({
+            "search": { short: [{ "id": "ZZZZZZZZZZ9", "duration": 12.0 }] },
+            "videos": { "ZZZZZZZZZZ9": sound_only_info("ZZZZZZZZZZ9", &site.audio.url("/a.m4a")) },
+        });
+        run_child(test, site.env(&dir, &script));
+        let made = calls(&dir.join("fake"));
+        let searched: Vec<&String> = made.iter().filter(|c| c.contains("ytsearch5:")).collect();
+        assert_eq!(searched, [&search_call(&format!("{PODCAST_SHOW} {PODCAST_LONG_TITLE}")), &search_call(short)]);
+        assert_eq!(site.feed.requests().len(), 0);
+        return;
+    }
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+
+    let played = play_entries_until(&player, "https://open.spotify.com/show/033OZDMSatg3WCetEI9bge", 0);
+
+    assert_eq!(played.len(), 1);
+    assert_eq!(played[0].title, format!("{PODCAST_LONG_TITLE} — {PODCAST_SHOW}"));
+    assert_eq!(played[0].info, format!("Spotify · {PODCAST_SHOW} · 1/1 · sound from YouTube"));
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn a_missing_episode_file_at_the_start_of_an_episode_link_is_skipped_with_a_note_naming_it() {
+    let test = "a_missing_episode_file_at_the_start_of_an_episode_link_is_skipped_with_a_note_naming_it";
+    if !is_child() {
+        let dir = fresh_dir("podcast_episode_gone");
+        let page = episode_embed_page("Bajka o smoku, część 2", PODCAST_SHOW, 3_000);
+        let gone = RangeServer::start(vec![]);
+        let gone_url = gone.url("/ep/gone.mp3");
+        let site = PodcastSite::start_with("/embed/episode/4kGynGaUBQwwRI3xTvpDPN", page, PODCAST_SHOW, [None, Some(gone_url.clone()), None]);
+        let mut env = site.env(&dir, &serde_json::json!({}));
+        env.push(("PLAYR_TEST_GONE", OsString::from(gone_url)));
+        run_child(test, env);
+        assert_eq!(calls(&dir.join("fake")), Vec::<String>::new());
+        return;
+    }
+    let gone_url = std::env::var("PLAYR_TEST_GONE").unwrap();
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+
+    let played = play_entries_until(&player, "https://open.spotify.com/episode/4kGynGaUBQwwRI3xTvpDPN", 2);
+
+    let seen: Vec<(usize, &str)> = played.iter().map(|s| (s.entry, s.title.as_str())).collect();
+    assert_eq!(seen, [(2, "Kołysanka — Zosia Cebulka - bajki do snu i zabawy")]);
+    assert_eq!(
+        played[0].notes,
+        [format!("skipped Bajka o smoku, część 2 — Zosia Cebulka - bajki do snu i zabawy: cannot open {gone_url}: http status: 404")]
+    );
+}
+
+fn slow_not_found_server(delay: Duration) -> String {
+    let listener = {
+        let _ports = common::http::PORTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind slow server")
+    };
+    let url = format!("http://{}/ep/slow.mp3", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                std::thread::sleep(delay);
+                let _ = conn.write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            });
+        }
+    });
+    url
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn while_a_feed_episode_opens_the_title_says_opening_it_not_finding_it_on_youtube() {
+    let test = "while_a_feed_episode_opens_the_title_says_opening_it_not_finding_it_on_youtube";
+    if !is_child() {
+        let dir = fresh_dir("podcast_opening_title");
+        let page = episode_embed_page("Kołysanka", PODCAST_SHOW, 4_000);
+        let slow = slow_not_found_server(Duration::from_millis(400));
+        let site = PodcastSite::start_with("/embed/show/033OZDMSatg3WCetEI9bge", page, PODCAST_SHOW, [Some(slow), None, None]);
+        run_child(test, site.env(&dir, &serde_json::json!({})));
+        return;
+    }
+    let link = "https://open.spotify.com/show/033OZDMSatg3WCetEI9bge";
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+
+    player.open(link);
+    let mut loading_titles: Vec<String> = Vec::new();
+    let last = wait_for_status(&player, "the second entry to play", |s| {
+        if s.state == State::Loading && s.source == link && loading_titles.last() != Some(&s.title) {
+            loading_titles.push(s.title.clone());
+        }
+        s.state == State::Playing && s.entry == 1
+    });
+    player.stop();
+
+    let opening_first = "Opening \u{201c}Pierwsza bajka — Zosia Cebulka - bajki do snu i zabawy\u{201d}…".to_string();
+    assert!(loading_titles.contains(&opening_first), "{loading_titles:?}");
+    assert!(!loading_titles.iter().any(|t| t.starts_with("Finding")), "{loading_titles:?}");
+    assert_eq!(last.info, "Spotify · Zosia Cebulka - bajki do snu i zabawy · 2/3 · podcast feed");
 }

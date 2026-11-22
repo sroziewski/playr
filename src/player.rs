@@ -18,6 +18,7 @@ use crate::cookies::{self, CookieJar};
 use crate::demux::{self, Demuxer};
 use crate::media::{AudioPacket, AudioTrack, MediaInfo, Packet, VideoFrame, VideoTrack, trim_decoded};
 use crate::net;
+use crate::podcast;
 use crate::spotify::{self, Playlist};
 use crate::vdec::{self, VideoDecoder};
 use crate::youtube::{self, Choice, Video};
@@ -97,7 +98,7 @@ pub struct Shared {
     youtube_cache: Mutex<Option<(String, Instant, Arc<Video>)>>,
     youtube_audio_only: AtomicBool,
     spotify_cache: Mutex<Option<(String, Instant, Arc<Playlist>)>>,
-    spotify_next: Mutex<Option<(String, usize, Instant, Arc<Video>)>>,
+    spotify_next: Mutex<Option<Prefetched>>,
     skipped: Mutex<Vec<String>>,
     cookies: Mutex<Option<(PathBuf, Arc<CookieJar>)>>,
     repaint: Box<dyn Fn() + Send + Sync>,
@@ -488,16 +489,18 @@ fn display_name(target: &str) -> String {
     Path::new(target).file_name().and_then(|n| n.to_str()).unwrap_or(target).to_string()
 }
 
+type Prefetched = (String, usize, Instant, Arc<Video>);
+
 fn spotify_entry_label(shared: &Shared, target: &str, entry: Option<usize>) -> Option<String> {
     let cache = shared.spotify_cache.lock().unwrap();
     let (url, _, list) = cache.as_ref()?;
-    (url == target).then(|| list.entries.get(entry.unwrap_or(0)).map(|e| e.label()))?
+    (url == target).then(|| list.entries.get(entry.unwrap_or(list.start)).map(|e| e.label()))?
 }
 
 fn next_entry(shared: &Shared, target: &str, entry: Option<usize>) -> Option<usize> {
     let cache = shared.spotify_cache.lock().unwrap();
     let (url, _, list) = cache.as_ref()?;
-    let next = entry.unwrap_or(0) + 1;
+    let next = entry.unwrap_or(list.start) + 1;
     (url == target && next < list.entries.len()).then_some(next)
 }
 
@@ -515,11 +518,11 @@ fn resolve_spotify(shared: &Arc<Shared>, url: &str) -> Result<Arc<Playlist>, Str
 }
 
 fn prefetch_entry(shared: &Arc<Shared>, target: String, list: Arc<Playlist>, index: usize, abort: Arc<AtomicBool>) {
-    let Some(item) = list.entries.get(index).cloned() else { return };
+    let Some(item) = list.entries.get(index).cloned().filter(|e| e.audio.is_none()) else { return };
     let shared = shared.clone();
     std::thread::spawn(move || {
         let quiet = |_: &str| {};
-        let Ok(found) = youtube::search(&item.query(), item.duration, &abort, &quiet) else { return };
+        let Ok(found) = youtube::search(&item.queries(), item.duration, &abort, &quiet) else { return };
         let Ok(video) = youtube::resolve(&found, ytdlp_cookies(&shared).as_deref(), &abort, &quiet) else { return };
         *shared.spotify_next.lock().unwrap() = Some((target, index, Instant::now(), Arc::new(video)));
     });
@@ -698,10 +701,13 @@ impl Session {
         let mut playlist = None;
         let demux: Box<dyn Demuxer> = if spotify::is_spotify_url(&target) {
             let list = resolve_spotify(shared, &target)?;
-            let index = entry.unwrap_or(0).min(list.entries.len().saturating_sub(1));
+            let index = entry.unwrap_or(list.start).min(list.entries.len().saturating_sub(1));
             let item = list.entries.get(index).cloned().ok_or("this Spotify list is empty")?;
             shared.update_status(|st| {
-                st.title = format!("Finding \u{201c}{}\u{201d} on YouTube…", item.label());
+                st.title = match item.audio {
+                    Some(_) => format!("Opening \u{201c}{}\u{201d}…", item.label()),
+                    None => format!("Finding \u{201c}{}\u{201d} on YouTube…", item.label()),
+                };
                 st.playlist = Some(list.clone());
                 st.entry = index;
             });
@@ -712,19 +718,24 @@ impl Session {
                 .take()
                 .filter(|(url, i, at, _)| *url == target && *i == index && at.elapsed() < YOUTUBE_CACHE_FOR)
                 .map(|(_, _, _, video)| video);
-            let video = match prefetched {
-                Some(video) => video,
+            let demuxer = match &item.audio {
+                Some(audio) => podcast::open_episode(audio, abort.clone())?,
                 None => {
-                    let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
-                    let found = youtube::search(&item.query(), item.duration, &abort, &progress)?;
-                    resolve_youtube(shared, &found, &abort)?
+                    let video = match prefetched {
+                        Some(video) => video,
+                        None => {
+                            let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
+                            let found = youtube::search(&item.queries(), item.duration, &abort, &progress)?;
+                            resolve_youtube(shared, &found, &abort)?
+                        }
+                    };
+                    youtube::open(&video, &Choice::default(), true, abort.clone())?.demuxer
                 }
             };
-            let opened = youtube::open(&video, &Choice::default(), true, abort.clone())?;
             title = item.label();
             finite = true;
             playlist = Some((list, index));
-            opened.demuxer
+            demuxer
         } else if youtube::is_youtube_url(&target) {
             let video = resolve_youtube(shared, &target, &abort)?;
             let audio_only = shared.youtube_audio_only();
@@ -792,7 +803,8 @@ impl Session {
             summary.push_str(" · sound only");
         }
         if let Some((list, index)) = &playlist {
-            summary = format!("Spotify · {} · {}/{} · sound from YouTube", list.name, index + 1, list.entries.len());
+            let from = if list.entries[*index].audio.is_some() { "podcast feed" } else { "sound from YouTube" };
+            summary = format!("Spotify · {} · {}/{} · {from}", list.name, index + 1, list.entries.len());
         }
         let advance = playlist
             .as_ref()
