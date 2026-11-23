@@ -253,13 +253,13 @@ fn pasted_text_opens_as_a_trimmed_url_or_an_existing_unquoted_path_and_nothing_e
 }
 
 #[test]
-fn the_speeds_are_youtubes_eight_steps() {
-    assert_eq!(SPEEDS, [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]);
+fn the_speeds_are_youtubes_eight_steps_plus_fine_steps_just_above_normal() {
+    assert_eq!(SPEEDS, [0.25, 0.5, 0.75, 1.0, 1.05, 1.1, 1.15, 1.25, 1.5, 1.75, 2.0]);
 }
 
 #[test]
 fn speed_label_drops_trailing_zeros_and_uses_the_multiplication_sign() {
-    let cases = [(1.0, "1×"), (1.25, "1.25×"), (0.5, "0.5×"), (0.25, "0.25×"), (2.0, "2×"), (1.333_333, "1.33×"), (0.756, "0.76×")];
+    let cases = [(1.0, "1×"), (1.25, "1.25×"), (0.5, "0.5×"), (0.25, "0.25×"), (2.0, "2×"), (1.333_333, "1.33×"), (0.756, "0.76×"), (1.05, "1.05×"), (1.1, "1.1×"), (1.15, "1.15×")];
     let mut bad = Vec::new();
     for (speed, expected) in cases {
         let actual = speed_label(speed);
@@ -273,11 +273,17 @@ fn speed_label_drops_trailing_zeros_and_uses_the_multiplication_sign() {
 
 #[test]
 fn speed_after_steps_through_the_speeds_and_stops_at_both_ends() {
-    let cases: [(f64, isize, f64); 18] = [
-        (1.0, 1, 1.25),
+    let cases: [(f64, isize, f64); 24] = [
+        (1.0, 1, 1.05),
+        (1.05, -1, 1.0),
+        (1.05, 1, 1.1),
+        (1.1, -1, 1.05),
+        (1.15, 1, 1.25),
         (1.0, -1, 0.75),
         (1.0, 0, 1.0),
-        (1.0, 3, 1.75),
+        (1.0, 3, 1.15),
+        (1.0, 4, 1.25),
+        (1.25, -1, 1.15),
         (1.0, -3, 0.25),
         (0.5, 2, 1.0),
         (2.0, 1, 2.0),
@@ -286,9 +292,9 @@ fn speed_after_steps_through_the_speeds_and_stops_at_both_ends() {
         (0.5, -100, 0.25),
         (1.0, isize::MAX, 2.0),
         (1.0, isize::MIN, 0.25),
-        (1.1, 1, 1.25),
-        (1.1, -1, 1.0),
-        (1.1, 0, 1.1),
+        (1.2, 1, 1.25),
+        (1.2, -1, 1.15),
+        (1.2, 0, 1.2),
         (3.0, -1, 2.0),
         (0.1, 1, 0.25),
         (1.25 + 1e-12, 1, 1.5),

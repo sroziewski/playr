@@ -14,11 +14,16 @@ use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::codecs::registry::CodecRegistry;
 
 use crate::audio_out::{AudioOut, AudioShared};
+use crate::bitrate::{Meter, Rate};
 use crate::cookies::{self, CookieJar};
 use crate::demux::{self, Demuxer};
+use crate::history::{self, History};
+use crate::hls;
+use crate::lists;
 use crate::media::{AudioPacket, AudioTrack, MediaInfo, Packet, VideoFrame, VideoTrack, trim_decoded};
 use crate::net;
 use crate::podcast;
+use crate::sites::{self, Page};
 use crate::spotify::{self, Playlist};
 use crate::vdec::{self, VideoDecoder};
 use crate::youtube::{self, Choice, Video};
@@ -72,6 +77,7 @@ pub struct Status {
     pub error: Option<String>,
     pub notes: Vec<String>,
     pub youtube: Option<Arc<Video>>,
+    pub page: Option<Arc<Page>>,
     pub choice: Choice,
     pub playlist: Option<Arc<Playlist>>,
     pub entry: usize,
@@ -97,10 +103,13 @@ pub struct Shared {
     abort: Mutex<Arc<AtomicBool>>,
     youtube_cache: Mutex<Option<(String, Instant, Arc<Video>)>>,
     youtube_audio_only: AtomicBool,
-    spotify_cache: Mutex<Option<(String, Instant, Arc<Playlist>)>>,
+    list_cache: Mutex<Option<(String, Instant, Option<Arc<Playlist>>)>>,
     spotify_next: Mutex<Option<Prefetched>>,
     skipped: Mutex<Vec<String>>,
     cookies: Mutex<Option<(PathBuf, Arc<CookieJar>)>>,
+    history: Mutex<(History, Option<PathBuf>)>,
+    bitrate: Mutex<Meter>,
+    page_cache: Mutex<Option<(String, Instant, Arc<Page>)>>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -115,12 +124,19 @@ impl Shared {
             abort: Mutex::new(Arc::new(AtomicBool::new(false))),
             youtube_cache: Mutex::new(None),
             youtube_audio_only: AtomicBool::new(false),
-            spotify_cache: Mutex::new(None),
+            list_cache: Mutex::new(None),
             spotify_next: Mutex::new(None),
             skipped: Mutex::new(Vec::new()),
             cookies: Mutex::new(None),
+            history: Mutex::new((History::default(), None)),
+            bitrate: Mutex::new(Meter::default()),
+            page_cache: Mutex::new(None),
             repaint,
         }
+    }
+
+    pub fn bitrate(&self) -> Option<Rate> {
+        self.bitrate.lock().unwrap().rate(self.position())
     }
 
     pub fn status(&self) -> Status {
@@ -276,7 +292,14 @@ pub struct Player {
 impl Player {
     /// `repaint` is called from the pipeline thread whenever the UI has something new to show.
     pub fn new(repaint: Box<dyn Fn() + Send + Sync>) -> Self {
+        Self::with_history(repaint, None)
+    }
+
+    pub fn with_history(repaint: Box<dyn Fn() + Send + Sync>, history_file: Option<PathBuf>) -> Self {
         let shared = Arc::new(Shared::new(repaint));
+        if let Some(path) = history_file {
+            *shared.history.lock().unwrap() = (History::load(&path), Some(path));
+        }
         let (tx, rx) = channel();
         let thread_shared = shared.clone();
         std::thread::Builder::new()
@@ -293,9 +316,27 @@ impl Player {
         let _ = self.tx.send(Cmd::Open(target.into(), None, None));
     }
 
+    pub fn history(&self) -> Vec<history::Item> {
+        self.shared.history.lock().unwrap().0.items.clone()
+    }
+
+    pub fn clear_history(&self) -> Result<(), String> {
+        let mut guard = self.shared.history.lock().unwrap();
+        guard.0.clear();
+        match &guard.1 {
+            Some(path) => guard.0.save(path),
+            None => Ok(()),
+        }
+    }
+
     pub fn open_youtube(&self, target: impl Into<String>, choice: Choice) {
         self.shared.abort_current();
         let _ = self.tx.send(Cmd::Open(target.into(), Some(choice), None));
+    }
+
+    pub fn open_youtube_at(&self, target: impl Into<String>, entry: Option<usize>, choice: Choice) {
+        self.shared.abort_current();
+        let _ = self.tx.send(Cmd::Open(target.into(), Some(choice), entry));
     }
 
     pub fn open_entry(&self, target: impl Into<String>, index: usize) {
@@ -422,7 +463,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 let failed = !matches!(opened, Ok(Ok(_)));
                 let failed_title = spotify_entry_label(&shared, &target, entry).unwrap_or_else(|| shared.status().title);
                 match opened {
-                    Ok(Ok(s)) => session = Some(s),
+                    Ok(Ok(s)) => {
+                        session = Some(s);
+                        record_history(&shared, &target);
+                    }
                     Ok(Err(e)) => shared.fail(e),
                     Err(_) => shared.fail("cannot open: internal error while reading the file".into()),
                 }
@@ -472,6 +516,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 
 fn begin_loading(shared: &Shared, target: &str) {
     shared.clear_frames();
+    shared.bitrate.lock().unwrap().clear();
     shared.audio.reset();
     shared.audio.set_free_run(false);
     shared.audio.take_device_error();
@@ -482,6 +527,16 @@ fn begin_loading(shared: &Shared, target: &str) {
     });
 }
 
+fn record_history(shared: &Shared, target: &str) {
+    let status = shared.status();
+    let title = status.playlist.as_ref().map_or(status.title, |list| list.name.clone());
+    let mut guard = shared.history.lock().unwrap();
+    guard.0.record(target, &title, cookies::now_unix());
+    if let Some(path) = &guard.1 {
+        let _ = guard.0.save(path);
+    }
+}
+
 fn display_name(target: &str) -> String {
     if net::is_url(target) {
         return target.to_string();
@@ -489,31 +544,94 @@ fn display_name(target: &str) -> String {
     Path::new(target).file_name().and_then(|n| n.to_str()).unwrap_or(target).to_string()
 }
 
+const UNENCRYPTED_NOTE: &str = "\u{1f513} unencrypted connection (http): the network can see what is playing";
+
 type Prefetched = (String, usize, Instant, Arc<Video>);
 
-fn spotify_entry_label(shared: &Shared, target: &str, entry: Option<usize>) -> Option<String> {
-    let cache = shared.spotify_cache.lock().unwrap();
+fn cached_list(shared: &Shared, target: &str) -> Option<Arc<Playlist>> {
+    let cache = shared.list_cache.lock().unwrap();
     let (url, _, list) = cache.as_ref()?;
-    (url == target).then(|| list.entries.get(entry.unwrap_or(list.start)).map(|e| e.label()))?
+    (url == target.trim()).then(|| list.clone())?
+}
+
+fn spotify_entry_label(shared: &Shared, target: &str, entry: Option<usize>) -> Option<String> {
+    let list = cached_list(shared, target)?;
+    list.entries.get(entry.unwrap_or(list.start)).map(|e| e.label())
 }
 
 fn next_entry(shared: &Shared, target: &str, entry: Option<usize>) -> Option<usize> {
-    let cache = shared.spotify_cache.lock().unwrap();
-    let (url, _, list) = cache.as_ref()?;
+    let list = cached_list(shared, target)?;
     let next = entry.unwrap_or(list.start) + 1;
-    (url == target && next < list.entries.len()).then_some(next)
+    (next < list.entries.len()).then_some(next)
 }
 
-fn resolve_spotify(shared: &Arc<Shared>, url: &str) -> Result<Arc<Playlist>, String> {
-    if let Some((cached, at, list)) = shared.spotify_cache.lock().unwrap().as_ref()
-        && cached == url
+fn is_list_target(target: &str) -> bool {
+    spotify::is_spotify_url(target)
+        || youtube::is_youtube_list_url(target)
+        || net::is_playlist_name(target) && crate::radio::find_by_url(target).is_none()
+}
+
+enum ListRead {
+    List(Playlist),
+    NotAList,
+    Unread,
+}
+
+fn read_list(shared: &Arc<Shared>, target: &str, abort: &Arc<AtomicBool>) -> Result<ListRead, String> {
+    let found = |list: Option<Playlist>| list.map_or(ListRead::NotAList, ListRead::List);
+    if spotify::is_spotify_url(target) {
+        shared.update_status(|st| st.title = "Reading the Spotify list…".to_string());
+        return spotify::fetch(target, shared.cookie_jar().as_deref()).map(|l| ListRead::List(l));
+    }
+    if youtube::is_youtube_list_url(target) {
+        let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
+        return match youtube::playlist(target, abort, &progress) {
+            Err(_) if youtube::plays_video_when_list_unread(target, abort.load(Ordering::Relaxed)) => Ok(ListRead::Unread),
+            other => other.map(found),
+        };
+    }
+    let (entries, single_counts) = if net::is_url(target) {
+        let text = crate::dash::get_text(target, &[], 256 * 1024)?;
+        let entries = lists::parse_remote(&text, target);
+        let only_relative = net::parse_playlist(&text).ok().flatten().is_none();
+        (entries, only_relative)
+    } else {
+        let mut raw = Vec::new();
+        std::fs::File::open(target)
+            .and_then(|f| f.take(256 * 1024).read_to_end(&mut raw))
+            .map_err(|e| format!("cannot read {target}: {e}"))?;
+        let entries = lists::parse(&String::from_utf8_lossy(&raw), Path::new(target).parent());
+        let local = entries.first().and_then(|e| e.audio.as_deref()).is_some_and(|a| !net::is_url(a));
+        (entries, local)
+    };
+    if entries.is_empty() || entries.len() == 1 && !single_counts {
+        return Ok(ListRead::NotAList);
+    }
+    Ok(ListRead::List(Playlist { name: lists::list_name(target), entries, start: 0 }))
+}
+
+fn resolve_list(
+    shared: &Arc<Shared>,
+    target: &str,
+    entry: Option<usize>,
+    abort: &Arc<AtomicBool>,
+) -> Result<Option<Arc<Playlist>>, String> {
+    if !is_list_target(target) {
+        return Ok(None);
+    }
+    if entry.is_some()
+        && let Some((cached, at, list)) = shared.list_cache.lock().unwrap().as_ref()
+        && cached == target
         && at.elapsed() < YOUTUBE_CACHE_FOR
     {
         return Ok(list.clone());
     }
-    shared.update_status(|st| st.title = "Reading the Spotify list…".to_string());
-    let list = Arc::new(spotify::fetch(url, shared.cookie_jar().as_deref())?);
-    *shared.spotify_cache.lock().unwrap() = Some((url.to_string(), Instant::now(), list.clone()));
+    let list = match read_list(shared, target, abort)? {
+        ListRead::List(list) => Some(Arc::new(list)),
+        ListRead::NotAList => None,
+        ListRead::Unread => return Ok(None),
+    };
+    *shared.list_cache.lock().unwrap() = Some((target.to_string(), Instant::now(), list.clone()));
     Ok(list)
 }
 
@@ -526,6 +644,24 @@ fn prefetch_entry(shared: &Arc<Shared>, target: String, list: Arc<Playlist>, ind
         let Ok(video) = youtube::resolve(&found, ytdlp_cookies(&shared).as_deref(), &abort, &quiet) else { return };
         *shared.spotify_next.lock().unwrap() = Some((target, index, Instant::now(), Arc::new(video)));
     });
+}
+
+fn resolve_page(shared: &Arc<Shared>, url: &str, abort: &Arc<AtomicBool>) -> Result<Arc<Page>, String> {
+    if let Some((cached, at, page)) = shared.page_cache.lock().unwrap().as_ref()
+        && cached == url
+        && sites::cache_fresh(at.elapsed())
+    {
+        return Ok(page.clone());
+    }
+    let asked = sites::ytdlp_address(url);
+    let progress = |message: &str| shared.update_status(|st| st.title = message.to_string());
+    let page = sites::parse_page(&youtube::page_info(&asked, abort, &progress)?)?;
+    if let Some(why) = sites::unplayable_reason(&page) {
+        return Err(why);
+    }
+    let page = Arc::new(page);
+    *shared.page_cache.lock().unwrap() = Some((url.to_string(), Instant::now(), page.clone()));
+    Ok(page)
 }
 
 fn ytdlp_cookies(shared: &Shared) -> Option<PathBuf> {
@@ -671,6 +807,8 @@ struct Session {
     read_error: Option<String>,
     abort: Arc<AtomicBool>,
     advance: Option<(String, usize)>,
+    /// The note that something came over plain HTTP is shown.
+    told_unencrypted: bool,
 }
 
 impl Drop for Session {
@@ -684,25 +822,33 @@ impl Session {
         let abort = Arc::new(AtomicBool::new(false));
         *shared.abort.lock().unwrap() = abort.clone();
         let mut target = target.trim().to_string();
-        if !net::is_url(&target) && net::is_playlist_name(&target) {
+        let list = resolve_list(shared, &target, entry, &abort)?;
+        let mut local_hls = None;
+        if list.is_none() && !net::is_url(&target) && net::is_playlist_name(&target) {
             let mut text = Vec::new();
             std::fs::File::open(&target)
-                .and_then(|f| f.take(256 * 1024).read_to_end(&mut text))
+                .and_then(|f| f.take(8 << 20).read_to_end(&mut text))
                 .map_err(|e| format!("cannot read {target}: {e}"))?;
-            target = net::parse_playlist(&String::from_utf8_lossy(&text))?
-                .ok_or("playlist contains no stream address")?;
+            let text = String::from_utf8_lossy(&text).into_owned();
+            if hls::is_hls(&text) {
+                local_hls = Some(text);
+            } else {
+                target = net::parse_playlist(&text)?.ok_or("playlist contains no stream address")?;
+            }
         }
 
         let mut title = display_name(&target);
-        let live = net::is_url(&target);
+        let mut live = net::is_url(&target);
         let mut finite = false;
         let mut video_info = None;
         let mut chosen = Choice::default();
         let mut playlist = None;
-        let demux: Box<dyn Demuxer> = if spotify::is_spotify_url(&target) {
-            let list = resolve_spotify(shared, &target)?;
+        let mut stream_finite = None;
+        let mut page_info: Option<Arc<Page>> = None;
+        let mut unencrypted = false;
+        let demux: Box<dyn Demuxer> = if let Some(list) = list {
             let index = entry.unwrap_or(list.start).min(list.entries.len().saturating_sub(1));
-            let item = list.entries.get(index).cloned().ok_or("this Spotify list is empty")?;
+            let item = list.entries.get(index).cloned().ok_or("this list is empty")?;
             shared.update_status(|st| {
                 st.title = match item.audio {
                     Some(_) => format!("Opening \u{201c}{}\u{201d}…", item.label()),
@@ -719,7 +865,31 @@ impl Session {
                 .filter(|(url, i, at, _)| *url == target && *i == index && at.elapsed() < YOUTUBE_CACHE_FOR)
                 .map(|(_, _, _, video)| video);
             let demuxer = match &item.audio {
-                Some(audio) => podcast::open_episode(audio, abort.clone())?,
+                Some(link) if youtube::is_youtube_url(link) => {
+                    let video = resolve_youtube(shared, link, &abort)?;
+                    let opened =
+                        youtube::open(&video, choice.unwrap_or(&Choice::default()), shared.youtube_audio_only(), abort.clone())?;
+                    chosen = opened.choice;
+                    video_info = Some(video);
+                    opened.demuxer
+                }
+                Some(link) if net::is_url(link) && spotify::is_spotify_url(&target) => {
+                    let opened = podcast::open_link(link, abort.clone(), Box::new(|_| {}))?;
+                    unencrypted = !opened.secure;
+                    opened.demuxer
+                }
+                Some(link) if net::is_url(link) => {
+                    let cb_shared = shared.clone();
+                    let on_title = Box::new(move |t| cb_shared.update_status(|st| st.now_playing = Some(t)));
+                    let opened = podcast::open_link(link, abort.clone(), on_title)?;
+                    unencrypted = !opened.secure;
+                    if !opened.ranged {
+                        live = true;
+                        stream_finite = Some(opened.finite);
+                    }
+                    opened.demuxer
+                }
+                Some(path) => demux::open_path(Path::new(path))?,
                 None => {
                     let video = match prefetched {
                         Some(video) => video,
@@ -732,8 +902,8 @@ impl Session {
                     youtube::open(&video, &Choice::default(), true, abort.clone())?.demuxer
                 }
             };
-            title = item.label();
-            finite = true;
+            title = video_info.as_ref().map_or_else(|| item.label(), |v| v.title.clone());
+            finite = stream_finite.unwrap_or(true);
             playlist = Some((list, index));
             demuxer
         } else if youtube::is_youtube_url(&target) {
@@ -741,28 +911,61 @@ impl Session {
             let audio_only = shared.youtube_audio_only();
             let opened = youtube::open(&video, choice.unwrap_or(&Choice::default()), audio_only, abort.clone())?;
             title = video.title.clone();
-            finite = true;
+            finite = !video.live;
             chosen = opened.choice;
             video_info = Some(video);
             opened.demuxer
         } else if live {
             let cb_shared = shared.clone();
-            let stream = net::open_url(
+            let mut stream = net::open_url(
                 &target,
                 abort.clone(),
                 Box::new(move |t| cb_shared.update_status(|st| st.now_playing = Some(t))),
             )?;
-            if let Some(name) = stream.name {
-                title = name;
+            if let Some(text) = stream.hls.take() {
+                let opened = hls::open(&hls::Location::Url(stream.url.clone()), Some(text), &[], false, abort.clone())?;
+                unencrypted = !stream.secure || !opened.secure;
+                if let Some(name) = stream.name {
+                    title = name;
+                }
+                finite = !opened.live;
+                opened.demuxer
+            } else if sites::is_html(stream.mime.as_deref()) {
+                let stream_secure = stream.secure;
+                drop(stream);
+                let page = resolve_page(shared, &target, &abort)?;
+                let format = page.pick(choice.and_then(|c| c.video.as_deref())).cloned().ok_or("the page has no video")?;
+                let (demuxer, secure) = sites::open(&page, &format, abort.clone())?;
+                unencrypted = !stream_secure || !secure;
+                title = page.title.clone();
+                finite = !format.hls || demuxer.info().duration.is_some();
+                chosen = Choice { video: Some(format.id.clone()), audio: None };
+                page_info = Some(page);
+                demuxer
+            } else {
+                unencrypted = !stream.secure;
+                if let Some(name) = stream.name {
+                    title = name;
+                }
+                finite = stream.finite;
+                demux::open_stream(stream.source, stream.ext.as_deref(), stream.mime.as_deref())?
             }
-            finite = stream.finite;
-            demux::open_stream(stream.source, stream.ext.as_deref(), stream.mime.as_deref())?
+        } else if let Some(text) = local_hls {
+            let opened = hls::open(&hls::Location::File(PathBuf::from(&target)), Some(text), &[], false, abort.clone())?;
+            unencrypted = !opened.secure;
+            finite = !opened.live;
+            live = opened.live;
+            opened.demuxer
         } else {
             demux::open_path(Path::new(&target))?
         };
 
         let info = demux.info().clone();
         let mut notes = info.notes.clone();
+        let told_unencrypted = unencrypted || demux.unencrypted();
+        if told_unencrypted {
+            notes.push(UNENCRYPTED_NOTE.into());
+        }
         notes.append(&mut shared.skipped.lock().unwrap());
         let mut vdec = None;
         if let Some(track) = &info.video {
@@ -796,15 +999,26 @@ impl Session {
             shared.set_speed(1.0);
         }
         let vtrack = info.video.clone().filter(|_| vdec.is_some());
-        let mut summary = if video_info.is_some() { "YouTube".to_string() } else { info.container.clone() };
+        let mut summary = match (&video_info, &page_info) {
+            (Some(_), _) => "YouTube".to_string(),
+            (None, Some(page)) => page.site.clone(),
+            (None, None) => info.container.clone(),
+        };
         if let Some(t) = &vtrack {
             summary.push_str(&format!(" · {} {}×{}", t.codec.name(), t.width, t.height));
         } else if video_info.is_some() {
             summary.push_str(" · sound only");
         }
         if let Some((list, index)) = &playlist {
-            let from = if list.entries[*index].audio.is_some() { "podcast feed" } else { "sound from YouTube" };
-            summary = format!("Spotify · {} · {}/{} · {from}", list.name, index + 1, list.entries.len());
+            let at = format!("{} · {}/{}", list.name, index + 1, list.entries.len());
+            summary = if spotify::is_spotify_url(&target) {
+                let from = if list.entries[*index].audio.is_some() { "podcast feed" } else { "sound from YouTube" };
+                format!("Spotify · {at} · {from}")
+            } else if video_info.is_some() {
+                format!("{summary} · playlist {at}")
+            } else {
+                format!("{summary} · {at}")
+            };
         }
         let advance = playlist
             .as_ref()
@@ -826,6 +1040,7 @@ impl Session {
             st.info = summary;
             st.notes = notes;
             st.youtube = video_info;
+            st.page = page_info.clone();
             st.choice = chosen;
             st.playlist = playlist.as_ref().map(|(list, _)| list.clone());
             st.entry = playlist.as_ref().map_or(0, |(_, index)| *index);
@@ -863,6 +1078,7 @@ impl Session {
             read_error: None,
             abort,
             advance,
+            told_unencrypted,
         })
     }
 
@@ -973,6 +1189,7 @@ impl Session {
     fn read_one(&mut self, shared: &Arc<Shared>, need_a: bool, need_v: bool) {
         match self.demux.next_packet() {
             Ok(Some(Packet::Video { pts, data })) => {
+                shared.bitrate.lock().unwrap().record(pts, data.len(), true);
                 if self.vdec.is_none() {
                     return;
                 }
@@ -983,6 +1200,7 @@ impl Session {
                 }
             }
             Ok(Some(Packet::Audio { pts, packet, skip, limit })) => {
+                shared.bitrate.lock().unwrap().record(pts, packet.data.len(), false);
                 let audio = AudioIn { pts, packet, skip, limit };
                 if self.adec.is_none() {
                     return;
@@ -1005,6 +1223,10 @@ impl Session {
     }
 
     fn housekeeping(&mut self, shared: &Arc<Shared>) {
+        if !self.told_unencrypted && self.demux.unencrypted() {
+            self.told_unencrypted = true;
+            shared.update_status(|st| st.notes.push(UNENCRYPTED_NOTE.into()));
+        }
         if !self.eof {
             // Audio has a hole (or ended before the video did, or cannot be decoded at all):
             // demuxing is as far ahead as it may go and still found none. Let the clock run
@@ -1185,6 +1407,7 @@ impl Session {
         }
         let end = self.info.duration.unwrap_or(f64::MAX);
         let target = if target.is_finite() { target.clamp(0.0, (end - 0.25).max(0.0)) } else { 0.0 };
+        shared.bitrate.lock().unwrap().clear();
         self.pending_v.clear();
         self.pending_a.clear();
         self.tail.clear();

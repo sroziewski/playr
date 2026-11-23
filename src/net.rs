@@ -249,6 +249,10 @@ pub struct HttpStream {
     pub url: String,
     /// A download of known length (a file) rather than an endless broadcast.
     pub finite: bool,
+    pub secure: bool,
+    /// The text of an HLS playlist found at `url`: the stream is to be opened with
+    /// [`crate::hls::open`], and `source` holds nothing.
+    pub hls: Option<String>,
 }
 
 /// Connects to `url`, following redirects and up to three levels of playlist indirection.
@@ -269,21 +273,20 @@ pub fn open_url_with_timeout(
     TLS.call_once(|| {
         let _ = rustls_rustcrypto::provider().install_default();
     });
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .max_redirects(8)
-        .user_agent("playr/0.1")
-        .build()
-        .into();
+    let agent = crate::dash::agent_with;
 
     let mut url = url.trim().to_string();
+    let mut every_hop_secure = true;
     for _ in 0..4 {
-        let resp = agent
-            .get(&url)
-            .header("Icy-MetaData", "1")
-            .call()
-            .map_err(|e| format!("cannot open {url}: {e}"))?;
+        let resp = crate::privacy::fetch(&url, |a| {
+            agent(a.https_only)
+                .get(&a.url)
+                .header("Icy-MetaData", "1")
+                .call()
+                .map_err(|e| format!("cannot open {}: {e}", a.url))
+        })?;
+        every_hop_secure &= !crate::privacy::is_unencrypted(&ureq::ResponseExt::get_uri(&resp).to_string());
+        let secure = every_hop_secure;
         let header = |name: &str| {
             resp.headers().get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_string())
         };
@@ -294,12 +297,20 @@ pub fn open_url_with_timeout(
         let name = header("icy-name").filter(|v| !v.is_empty());
         let finite = metaint.is_none() && header("content-length").is_some_and(|v| v.parse::<u64>().is_ok());
 
+        let landed = ureq::ResponseExt::get_uri(&resp).to_string();
         if mime.as_deref().is_some_and(is_playlist_mime) || is_playlist_name(&url) {
             let mut text = String::new();
-            let mut limited = resp.into_body().into_reader().take(256 * 1024);
+            // HLS recordings list every segment: a two-hour film runs to hundreds of kilobytes.
+            let mut limited = resp.into_body().into_reader().take(8 << 20);
             let mut raw = Vec::new();
             limited.read_to_end(&mut raw).map_err(|e| format!("cannot read playlist: {e}"))?;
             text.push_str(&String::from_utf8_lossy(&raw));
+            if crate::hls::is_hls(&text) {
+                // Segment addresses are relative to where the playlist was finally found.
+                let url = landed;
+                let source: Box<dyn MediaSource> = Box::new(StreamSource(io::empty()));
+                return Ok(HttpStream { source, ext: None, mime, name, url, finite: false, secure, hls: Some(text) });
+            }
             url = parse_playlist(&text)?.ok_or("playlist contains no stream address")?;
             continue;
         }
@@ -318,7 +329,7 @@ pub fn open_url_with_timeout(
             Some(n) => Box::new(StreamSource(IcyReader::new(pipe, n, on_title))),
             None => Box::new(StreamSource(pipe)),
         };
-        return Ok(HttpStream { source, ext, mime, name, url, finite });
+        return Ok(HttpStream { source, ext, mime, name, url, finite, secure, hls: None });
     }
     Err("too many playlist redirections".into())
 }

@@ -31,6 +31,11 @@ pub trait Demuxer {
     /// Repositions at or before `secs` and returns where it landed. The next video packet is
     /// not guaranteed to be a keyframe; the caller searches for one.
     fn seek(&mut self, secs: f64) -> Result<f64, String>;
+    /// Whether anything read so far crossed the network unencrypted, for sources that keep
+    /// fetching after they open (HLS); the others report this when opened.
+    fn unencrypted(&self) -> bool {
+        false
+    }
 }
 
 /// Opens a local file, picking the demuxer from its content rather than its name.
@@ -84,11 +89,11 @@ pub fn mp4_audio_priming_secs(path: &Path) -> f64 {
     read_moov(path).and_then(|(_, moov)| audio_priming_from_moov(&moov)).unwrap_or(0.0)
 }
 
-fn be32(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-fn be64(b: &[u8], at: usize) -> Option<u64> {
+pub(crate) fn be64(b: &[u8], at: usize) -> Option<u64> {
     b.get(at..at + 8).map(|s| u64::from_be_bytes(s.try_into().expect("8 bytes")))
 }
 
@@ -127,7 +132,7 @@ pub(crate) fn read_moov(path: &Path) -> Option<(u64, Vec<u8>)> {
 }
 
 /// Child boxes of an MP4 container box body, as (type, body).
-fn boxes(body: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+pub(crate) fn boxes(body: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         let size = be32(body, pos)? as usize;
@@ -141,7 +146,7 @@ fn boxes(body: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
     })
 }
 
-fn child<'a>(body: &'a [u8], ty: &[u8; 4]) -> Option<&'a [u8]> {
+pub(crate) fn child<'a>(body: &'a [u8], ty: &[u8; 4]) -> Option<&'a [u8]> {
     boxes(body).find(|(t, _)| t == ty).map(|(_, b)| b)
 }
 

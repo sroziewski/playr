@@ -213,14 +213,34 @@ fn extension(url: &str) -> Option<String> {
 /// Opens an episode's audio file: seekable over HTTP ranges when the server allows them,
 /// otherwise as a plain download that plays from the start.
 pub fn open_episode(url: &str, abort: Arc<AtomicBool>) -> Result<Box<dyn Demuxer>, String> {
+    open_link(url, abort, Box::new(|_| {})).map(|opened| opened.demuxer)
+}
+
+pub struct Opened {
+    pub demuxer: Box<dyn Demuxer>,
+    pub ranged: bool,
+    pub finite: bool,
+    pub name: Option<String>,
+    pub secure: bool,
+}
+
+pub fn open_link(url: &str, abort: Arc<AtomicBool>, on_title: net::TitleCallback) -> Result<Opened, String> {
     if let Ok((fetch, _)) = HttpFetch::connect(url, &[], 1) {
+        let secure = fetch.is_encrypted();
         let source = RangeSource::new(Arc::new(fetch), abort.clone());
         // Symphonia's accurate MP3 seek reads every frame up to the target, which over the
         // network means downloading it; the coarse seek jumps by the bitrate instead.
         if let Ok(demux) = SymDemuxer::open(Box::new(source), extension(url).as_deref(), None) {
-            return Ok(Box::new(demux.with_coarse_seeking()));
+            return Ok(Opened { demuxer: Box::new(demux.with_coarse_seeking()), ranged: true, finite: true, name: None, secure });
         }
     }
-    let stream = net::open_url(url, abort, Box::new(|_| {}))?;
-    demux::open_stream(stream.source, stream.ext.as_deref().or(extension(url).as_deref()), stream.mime.as_deref())
+    let stream = net::open_url(url, abort.clone(), on_title)?;
+    if let Some(text) = stream.hls {
+        let opened = crate::hls::open(&crate::hls::Location::Url(stream.url), Some(text), &[], false, abort)?;
+        let secure = stream.secure && opened.secure;
+        return Ok(Opened { demuxer: opened.demuxer, ranged: false, finite: !opened.live, name: stream.name, secure });
+    }
+    let demuxer =
+        demux::open_stream(stream.source, stream.ext.as_deref().or(extension(url).as_deref()), stream.mime.as_deref())?;
+    Ok(Opened { demuxer, ranged: false, finite: stream.finite, name: stream.name, secure: stream.secure })
 }

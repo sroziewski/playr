@@ -139,7 +139,6 @@ fn playlist_links_resolve_to_the_stream_they_name() {
 fn playlists_that_lead_nowhere_are_reported() {
     let server = RadioServer::start(mp3());
     let cases = [
-        ("/hls.m3u8", "HLS streams are not supported"),
         ("/empty.m3u", "playlist contains no stream address"),
         ("/loop.m3u", "too many playlist redirections"),
     ];
@@ -147,7 +146,22 @@ fn playlists_that_lead_nowhere_are_reported() {
         let (stream, _) = open(&server.url(path));
         assert_eq!(stream.err().as_deref(), Some(message), "{path}");
     }
-    assert_eq!(server.requests_for("/segment0.ts").len(), 0, "an HLS segment must not be fetched");
+}
+
+#[test]
+fn an_hls_playlist_is_handed_back_as_text_for_the_hls_player_without_fetching_a_segment() {
+    let server = RadioServer::start(mp3());
+    let url = server.url("/hls.m3u8");
+
+    let (stream, titles) = open(&url);
+
+    let mut stream = stream.expect("an HLS playlist opens");
+    let expected = format!("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\n{}\n", server.url("/segment0.ts"));
+    assert_eq!(stream.hls.as_deref(), Some(expected.as_str()));
+    assert_eq!((stream.url.as_str(), stream.mime.as_deref(), stream.secure), (url.as_str(), Some("application/vnd.apple.mpegurl"), true));
+    assert_eq!(read_to_end(&mut stream), Vec::<u8>::new(), "the source of an HLS stream holds nothing");
+    assert_eq!(*titles.lock().unwrap(), Vec::<String>::new());
+    assert_eq!(server.requests_for("/segment0.ts").len(), 0, "open_url must not fetch a segment");
 }
 
 #[test]

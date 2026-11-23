@@ -2,8 +2,10 @@
 #![allow(dead_code)]
 
 pub mod avi;
+pub mod hls_server;
 pub mod http;
 pub mod range_http;
+pub mod ts_build;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

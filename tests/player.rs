@@ -495,7 +495,7 @@ fn files_that_cannot_be_played_fail_with_a_readable_error() {
     let garbage = tmp_file("player_garbage.mp4", &(0..50_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect::<Vec<u8>>());
     let empty = tmp_file("player_empty.mkv", &[]);
     let no_address = tmp_file("player_empty.m3u", b"#EXTM3U\n# nothing\n");
-    let hls = tmp_file("player_hls.m3u8", b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttp://127.0.0.1:9/seg0.ts\n");
+    let hls = tmp_file("player_hls.m3u8", b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttp://127.0.0.1:9/seg0.ts\n#EXT-X-ENDLIST\n");
 
     // (target, how the error has to start, whether that is the whole message)
     let cases = [
@@ -504,7 +504,8 @@ fn files_that_cannot_be_played_fail_with_a_readable_error() {
         (empty.to_str().unwrap().to_string(), "unrecognised or unsupported format (".to_string(), false),
         (path_of("mjpeg_ac3.avi"), "audio format 0x2000 in AVI is not supported; no decoder for MJPG video".to_string(), true),
         (no_address.to_str().unwrap().to_string(), "playlist contains no stream address".to_string(), true),
-        (hls.to_str().unwrap().to_string(), "HLS streams are not supported".to_string(), true),
+        // Nothing listens on port 9: the playlist is read as HLS and its segment cannot be fetched.
+        (hls.to_str().unwrap().to_string(), "cannot download http://127.0.0.1:9/seg0.ts: ".to_string(), false),
     ];
     let s = start();
     for (target, message, exact) in cases {

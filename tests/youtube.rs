@@ -160,6 +160,53 @@ mod video_formats {
         );
     }
 
+    fn live_fmt(id: &str, height: Option<u32>, vcodec: &str, acodec: &str, protocol: &str, tbr: f64) -> Value {
+        json!({
+            "format_id": id, "url": format!("https://v.example/{id}"), "vcodec": vcodec, "acodec": acodec,
+            "protocol": protocol, "ext": "mp4", "width": height.map(|h| h * 16 / 9), "height": height, "fps": 30.0, "tbr": tbr,
+        })
+    }
+
+    #[test]
+    fn a_live_video_offers_its_h264_aac_hls_formats_one_per_height_highest_first() {
+        let formats = vec![
+            live_fmt("92", Some(240), "avc1.4d4015", "mp4a.40.5", "m3u8", 300.0),
+            live_fmt("95", Some(720), "avc1.4d401f", "mp4a.40.2", "m3u8_native", 2500.0),
+            // The same height again: the first one stays.
+            live_fmt("95b", Some(720), "avc1.4d401f", "mp4a.40.2", "m3u8_native", 3000.0),
+            live_fmt("96", Some(1080), "avc1.640028", "mp4a.40.2", "m3u8_native", 4500.0),
+            live_fmt("vp9", Some(1440), "vp09.00.50.08", "mp4a.40.2", "m3u8_native", 9000.0),
+            live_fmt("no-sound", Some(480), "avc1.4d401e", "none", "m3u8_native", 1200.0),
+            live_fmt("opus", Some(360), "avc1.4d401e", "opus", "m3u8_native", 800.0),
+            live_fmt("dash", Some(144), "avc1.4d400c", "none", "https", 100.0),
+            live_fmt("no-height", None, "avc1.4d401e", "mp4a.40.2", "m3u8_native", 700.0),
+        ];
+
+        let live = parse_info(&info_json(formats.clone(), json!({ "is_live": true }))).expect("parse");
+        let recorded = parse_info(&info_json(formats, json!({ "is_live": false }))).expect("parse");
+
+        assert_eq!(
+            live.video,
+            vec![vf("96", 1920, 1080, 30.0, 4500.0), vf("95", 1280, 720, 30.0, 2500.0), vf("92", 426, 240, 30.0, 300.0)]
+        );
+        assert_eq!((live.live, unplayable_reason(&live)), (true, None));
+        // Only a live video is played over HLS; a recording's HLS formats stay unused.
+        assert_eq!(recorded.video, vec![vf("dash", 256, 144, 30.0, 100.0)]);
+    }
+
+    #[test]
+    fn a_live_video_without_an_h264_aac_hls_format_says_so() {
+        let formats = vec![
+            live_fmt("vp9", Some(1440), "vp09.00.50.08", "mp4a.40.2", "m3u8_native", 9000.0),
+            live_fmt("dash", Some(144), "avc1.4d400c", "none", "https", 100.0),
+        ];
+
+        let live = parse_info(&info_json(formats, json!({ "is_live": true }))).expect("parse");
+
+        assert_eq!(live.video, vec![]);
+        assert_eq!(unplayable_reason(&live).as_deref(), Some("YouTube offers this live stream in no format playr can play"));
+    }
+
     #[test]
     fn label_is_the_height_with_the_frame_rate_only_above_31_fps() {
         let cases = [(1080, 30.0, "1080p"), (720, 31.0, "720p"), (720, 48.0, "720p48"), (1080, 59.94, "1080p60"), (144, 0.0, "144p")];
@@ -569,7 +616,7 @@ mod choosing {
     }
 
     #[test]
-    fn unplayable_reason_explains_live_videos_and_videos_without_usable_streams() {
+    fn unplayable_reason_explains_live_videos_and_videos_without_usable_streams_and_lets_live_hls_play() {
         let playable = sample_video();
         let mut audio_only = sample_video();
         audio_only.video.clear();
@@ -582,14 +629,18 @@ mod choosing {
         live.live = true;
         let mut live_and_nothing = nothing.clone();
         live_and_nothing.live = true;
-        let live_msg = "YouTube live streams are not supported (YouTube sends them only as HLS)";
+        // A live video's HLS qualities are its `video` formats; sound travels inside them.
+        let mut live_without_hls = live.clone();
+        live_without_hls.video.clear();
+        let live_msg = "YouTube offers this live stream in no format playr can play";
         let none_msg = "YouTube offers no H.264 or AAC stream for this video";
 
         assert_eq!(unplayable_reason(&playable), None);
         assert_eq!(unplayable_reason(&audio_only), None);
         assert_eq!(unplayable_reason(&video_only), None);
         assert_eq!(unplayable_reason(&nothing).as_deref(), Some(none_msg));
-        assert_eq!(unplayable_reason(&live).as_deref(), Some(live_msg));
+        assert_eq!(unplayable_reason(&live), None);
+        assert_eq!(unplayable_reason(&live_without_hls).as_deref(), Some(live_msg));
         assert_eq!(unplayable_reason(&live_and_nothing).as_deref(), Some(live_msg));
     }
 }

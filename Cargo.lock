@@ -2267,6 +2267,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "playr"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "cpal",
  "eframe",
  "embed-resource",
@@ -2281,6 +2282,7 @@ dependencies = [
  "symphonia",
  "symphonia-adapter-opus-rs",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

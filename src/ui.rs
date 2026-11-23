@@ -1,15 +1,21 @@
 //! The window: video surface, overlay controls, keyboard shortcuts, drag-and-drop.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, Key, RichText, ViewportCommand};
 use eframe::egui_glow;
 
+use crate::bitrate;
 use crate::cookies;
+use crate::corner::{self, Corner};
+use crate::history;
+use crate::privacy;
 use crate::controls::{
-    self, DEFAULT_STEP, Icon, SKIP_STEPS, SPEEDS, Shortcut, SkipChain, icon_button, skip_label, speed_label, step_label,
+    self, Back, DEFAULT_STEP, Icon, SKIP_STEPS, SPEEDS, Shortcut, SkipChain, StageClick, icon_button, skip_label, speed_label, step_label,
 };
 use crate::media::format_time;
 use crate::net;
@@ -44,6 +50,15 @@ pub struct App {
     radio_query: String,
     captions: Captions,
     cookie_note: Option<String>,
+    corner: Option<(Corner, f32)>,
+    corner_share: f32,
+    corner_on_top: bool,
+    corner_restore: Option<(egui::Pos2, egui::Vec2)>,
+    corner_pending: Option<Corner>,
+    last_click_paused: bool,
+    history_exists: Arc<Mutex<(Option<Instant>, HashMap<String, bool>)>>,
+    history_checking: Arc<AtomicBool>,
+    bitrate_shown: Option<bitrate::Display>,
 }
 
 #[derive(Default)]
@@ -57,9 +72,12 @@ struct Captions {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<String>) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let player = Player::new(Box::new(move || ctx.request_repaint()));
+        let player = Player::with_history(Box::new(move || ctx.request_repaint()), history::default_path());
         if let Some(saved) = cookies::saved_path() {
             let _ = player.set_cookies(Some(saved));
+        }
+        if let Some(path) = privacy::settings_path() {
+            privacy::set_https_only(privacy::load(&path));
         }
         if let Some(target) = initial {
             player.open(target);
@@ -81,6 +99,15 @@ impl App {
             radio_query: String::new(),
             captions: Captions::default(),
             cookie_note: None,
+            corner: None,
+            corner_share: corner::DEFAULT_SHARE,
+            corner_on_top: corner::KEEP_ON_TOP,
+            corner_restore: None,
+            corner_pending: None,
+            last_click_paused: false,
+            history_exists: Arc::new(Mutex::new((None, HashMap::new()))),
+            history_checking: Arc::new(AtomicBool::new(false)),
+            bitrate_shown: None,
         }
     }
 
@@ -161,8 +188,16 @@ impl App {
         let Some(list) = status.playlist.clone() else { return };
         let count = list.entries.len();
         let at = status.entry.min(count.saturating_sub(1));
-        if ui.add_enabled(at > 0, egui::Button::new("⏮")).on_hover_text("Previous in the list").clicked() {
-            self.player.open_entry(status.source.clone(), at - 1);
+        let action = controls::back_action(self.player.shared.position(), status.seekable, at);
+        let back = ui
+            .add_enabled(action != Back::Disabled, egui::Button::new("⏮"))
+            .on_hover_text("Back to the start of this one, or the previous in the list");
+        if back.clicked() {
+            match action {
+                Back::Restart => self.player.seek(0.0),
+                Back::Previous => self.player.open_entry(status.source.clone(), at - 1),
+                Back::Disabled => {}
+            }
         }
         ui.menu_button(format!("📃 {}/{}", at + 1, count), |ui| {
             ui.strong(&list.name);
@@ -178,7 +213,7 @@ impl App {
             });
         })
         .response
-        .on_hover_text("Spotify list (played from YouTube, sound only)");
+        .on_hover_text("The list: pick any entry");
         if ui.add_enabled(at + 1 < count, egui::Button::new("⏭")).on_hover_text("Next in the list").clicked() {
             self.player.open_entry(status.source.clone(), at + 1);
         }
@@ -195,7 +230,8 @@ impl App {
 
     fn reopen_youtube(&mut self, status: &Status, choice: Choice, what: &str) {
         let position = self.player.shared.position();
-        self.player.open_youtube(status.source.clone(), choice);
+        let entry = status.playlist.as_ref().map(|_| status.entry);
+        self.player.open_youtube_at(status.source.clone(), entry, choice);
         self.player.seek(position);
         self.show_osd(format!("Switching to {what}…"));
     }
@@ -334,8 +370,22 @@ impl App {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         let response = ui.interact(rect, ui.scope_id().with("stage"), egui::Sense::click());
-        if response.double_clicked() {
-            Self::toggle_fullscreen(ui.ctx());
+        let allowed = controls::stage_input_allowed(self.url_open, egui::Popup::is_any_open(ui.ctx()));
+        let action = controls::stage_step(
+            &mut self.last_click_paused,
+            response.clicked(),
+            response.double_clicked(),
+            allowed,
+            status.state == State::Playing,
+        );
+        match action {
+            StageClick::Nothing => {}
+            StageClick::TogglePause => self.player.toggle_pause(),
+            StageClick::Fullscreen => Self::toggle_fullscreen(ui.ctx()),
+            StageClick::FullscreenAndUndoPause => {
+                self.player.toggle_pause();
+                Self::toggle_fullscreen(ui.ctx());
+            }
         }
 
         let size = self.frame_size.or(status.video).filter(|&(w, h)| w > 0 && h > 0);
@@ -521,6 +571,11 @@ impl App {
             }
             let radio_label = if radio::find_by_url(&status.source).is_some() { "📻 Radio ●" } else { "📻 Radio" };
             ui.menu_button(radio_label, |ui| self.radio_menu(ui, status));
+            ui.menu_button("🕘 History", |ui| self.history_menu(ui, status));
+            let corner_label = if self.corner.is_some() { "◲ Corner ●" } else { "◲ Corner" };
+            ui.menu_button(corner_label, |ui| self.corner_menu(ui, ctx, status))
+                .response
+                .on_hover_text("Play small in a corner of the screen");
             ui.separator();
             let speed = shared.speed();
             ui.add_enabled_ui(status.seekable, |ui| {
@@ -540,7 +595,11 @@ impl App {
             if let Some(video) = status.youtube.clone() {
                 self.youtube_menus(ui, ctx, status, &video);
             }
+            if let Some(page) = status.page.clone() {
+                self.page_menu(ui, status, &page);
+            }
             self.playlist_controls(ui, status);
+            self.bitrate_label(ui, ctx, status);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             let (icon, tip) = if fullscreen {
                 (Icon::ExitFullscreen, "Exit full screen (F12, F, Esc)")
@@ -558,6 +617,26 @@ impl App {
             };
             ui.add(egui::Label::new(RichText::new(text).weak()).truncate());
         });
+    }
+
+    fn page_menu(&mut self, ui: &mut egui::Ui, status: &Status, page: &crate::sites::Page) {
+        if page.formats.len() < 2 {
+            return;
+        }
+        let current = page.pick(status.choice.video.as_deref());
+        let label = current.map_or_else(|| "Quality".to_string(), |f| format!("⚙ {}", f.label()));
+        ui.menu_button(label, |ui| {
+            for format in page.formats.iter().rev() {
+                let selected = current.is_some_and(|c| c.id == format.id);
+                if ui.add(egui::Button::selectable(selected, format.label())).clicked() && !selected {
+                    let choice = Choice { video: Some(format.id.clone()), audio: None };
+                    self.reopen_youtube(status, choice, &format.label());
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Picture quality");
     }
 
     fn youtube_menus(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status, video: &Video) {
@@ -642,8 +721,191 @@ impl App {
         .on_hover_text("Subtitles / captions (C)");
     }
 
+    fn video_aspect(status: &Status) -> Option<f32> {
+        status.video.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| w as f32 / h as f32)
+    }
+
+    fn bitrate_label(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status) {
+        if status.state != State::Playing {
+            self.bitrate_shown = None;
+            return;
+        }
+        let paused = self.player.shared.is_paused();
+        let shared = self.player.shared.clone();
+        self.bitrate_shown = bitrate::Display::step(self.bitrate_shown, Instant::now(), paused, || shared.bitrate());
+        let Some(display) = self.bitrate_shown else {
+            ui.weak("— kb/s").on_hover_text("Bitrate: measuring the first seconds");
+            return;
+        };
+        let rate = display.rate;
+        let tip = format!(
+            "Bitrate over the last {:.0} s of playback\npicture {}\nsound {}",
+            bitrate::WINDOW,
+            bitrate::format(rate.video),
+            bitrate::format(rate.audio)
+        );
+        ui.weak(bitrate::format(display.shown)).on_hover_text(tip);
+        if !paused && display.settling() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn picture_aspect(status: &Status) -> f32 {
+        Self::video_aspect(status).unwrap_or(16.0 / 9.0)
+    }
+
+    fn place_in_corner(&mut self, ctx: &egui::Context, corner: Corner, aspect: f32) {
+        let viewport = ctx.input(|i| i.viewport().clone());
+        let ppp = ctx.pixels_per_point();
+        let (outer, inner) = (viewport.outer_rect, viewport.inner_rect);
+        let frame = match (outer, inner) {
+            (Some(o), Some(i)) => corner::Frame::between(o, i),
+            _ => corner::Frame { top: 32.0, ..Default::default() },
+        };
+        let center = outer.map_or(egui::pos2(100.0, 100.0), |r| r.center());
+        let work = corner::work_area_px(center * ppp)
+            .map(|r| egui::Rect::from_min_max(r.min / ppp, r.max / ppp))
+            .or_else(|| viewport.monitor_size.map(|s| egui::Rect::from_min_size(egui::Pos2::ZERO, s)));
+        let Some(work) = work else {
+            self.show_osd("The screen size is not known here");
+            return;
+        };
+        let fullscreen = viewport.fullscreen.unwrap_or(false);
+        let maximized = viewport.maximized.unwrap_or(false);
+        if corner::defer_placement(fullscreen, maximized) {
+            ctx.send_viewport_cmd(if fullscreen { ViewportCommand::Fullscreen(false) } else { ViewportCommand::Maximized(false) });
+            self.corner_pending = Some(corner);
+            ctx.request_repaint();
+            return;
+        }
+        if self.corner.is_none()
+            && let (Some(o), Some(i)) = (outer, inner)
+        {
+            self.corner_restore = Some((o.min, i.size()));
+        }
+        let (pos, size) = corner::placement(work, corner, self.corner_share, aspect, frame);
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(corner::CORNER_MIN_INNER));
+        let level = if self.corner_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        self.corner = Some((corner, aspect));
+    }
+
+    fn leave_corner(&mut self, ctx: &egui::Context) {
+        self.corner = None;
+        self.corner_pending = None;
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(corner::NORMAL_MIN_INNER));
+        if let Some((pos, size)) = self.corner_restore.take() {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        }
+    }
+
+    fn corner_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status) {
+        let aspect = Self::picture_aspect(status);
+        let current = self.corner.map(|(c, _)| c);
+        egui::Grid::new("corner-grid").show(ui, |ui| {
+            for (i, c) in Corner::ALL.into_iter().enumerate() {
+                if ui.add(egui::Button::selectable(current == Some(c), c.label())).clicked() {
+                    self.place_in_corner(ctx, c, aspect);
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.separator();
+        let mut percent = self.corner_share * 100.0;
+        let slider = egui::Slider::new(&mut percent, corner::MIN_SHARE * 100.0..=corner::MAX_SHARE * 100.0)
+            .suffix("% of the screen width")
+            .step_by(2.5);
+        if ui.add(slider).changed() {
+            self.corner_share = percent / 100.0;
+            if let Some(c) = current {
+                self.place_in_corner(ctx, c, aspect);
+            }
+        }
+        if ui.checkbox(&mut self.corner_on_top, "Keep on top of other windows").changed()
+            && let Some(c) = current
+        {
+            self.place_in_corner(ctx, c, aspect);
+        }
+        if ui.add_enabled(current.is_some(), egui::Button::new("⤢ Back to normal")).clicked() {
+            self.leave_corner(ctx);
+            ui.close();
+        }
+    }
+
+    fn check_history_files(&self, ctx: &egui::Context, items: &[history::Item]) {
+        let mut guard = self.history_exists.lock().unwrap();
+        if guard.0.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) || self.history_checking.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        guard.0 = Some(Instant::now());
+        let paths: Vec<String> = items.iter().map(|i| i.target.clone()).filter(|t| !net::is_url(t)).collect();
+        let shared = self.history_exists.clone();
+        let checking = self.history_checking.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let found: Vec<(String, bool)> = paths.into_iter().map(|p| {
+                let exists = std::path::Path::new(&p).exists();
+                (p, exists)
+            }).collect();
+            shared.lock().unwrap().1.extend(found);
+            checking.store(false, Ordering::Release);
+            ctx.request_repaint();
+        });
+    }
+
+    fn history_menu(&mut self, ui: &mut egui::Ui, status: &Status) {
+        let items = self.player.history();
+        if items.is_empty() {
+            ui.weak("Nothing played yet");
+            return;
+        }
+        ui.set_min_width(320.0);
+        self.check_history_files(ui.ctx(), &items);
+        let exists = self.history_exists.lock().unwrap().1.clone();
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for item in &items {
+                let missing = !controls::history_item_enabled(&item.target, exists.get(&item.target).copied());
+                let current = item.target == status.source;
+                let button = egui::Button::selectable(current, item.title.as_str());
+                let hover = if missing { format!("{}\n(file not found)", item.target) } else { item.target.clone() };
+                if ui.add_enabled(!missing, button).on_hover_text(hover).on_disabled_hover_text(format!("{}\n(file not found)", item.target)).clicked() {
+                    self.player.open(item.target.clone());
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Clear history").clicked() {
+            if let Err(e) = self.player.clear_history() {
+                self.show_osd(e);
+            }
+            ui.close();
+        }
+    }
+
+    fn https_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut on = privacy::https_only();
+        let tip = "On: playr fetches over https only, so the Wi-Fi or VPN sees which site you use but not what you watch or listen to. Servers without https are refused.\nOff: such servers are played over plain http, readable on the way (marked \u{1f513}).\nSite names still show to the network (through DNS and the start of every https connection). Addresses on this computer are exempt. yt-dlp makes its own connections for YouTube and web pages, over https.";
+        if ui.checkbox(&mut on, "\u{1f512} Encrypted connections only (https)").on_hover_text(tip).changed() {
+            privacy::set_https_only(on);
+            if let Some(path) = privacy::settings_path()
+                && let Err(e) = privacy::save(&path, on)
+            {
+                self.show_osd(e);
+            }
+        }
+    }
+
     fn radio_menu(&mut self, ui: &mut egui::Ui, status: &Status) {
         ui.set_min_width(280.0);
+        self.https_toggle(ui);
+        ui.separator();
         ui.add(egui::TextEdit::singleline(&mut self.radio_query).hint_text("Search stations or genres…").desired_width(260.0));
         ui.separator();
         let playing = status.source.as_str();
@@ -705,6 +967,7 @@ impl App {
                     submit = ui.button("Play").clicked() || enter;
                 });
                 ui.separator();
+                self.https_toggle(ui);
                 self.cookie_row(ui);
             });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -778,6 +1041,15 @@ impl eframe::App for App {
         if self.url_open {
             self.draw_url_dialog(&ctx);
         }
+        let windowed = ctx.input(|i| !corner::defer_placement(i.viewport().fullscreen.unwrap_or(false), i.viewport().maximized.unwrap_or(false)));
+        if let Some(c) = self.corner_pending.filter(|_| windowed) {
+            self.corner_pending = None;
+            self.place_in_corner(&ctx, c, Self::picture_aspect(&status));
+        } else if let Some((c, applied)) = self.corner
+            && let Some(aspect) = corner::needs_replace(applied, Self::video_aspect(&status))
+        {
+            self.place_in_corner(&ctx, c, aspect);
+        }
     }
 }
 
@@ -794,7 +1066,7 @@ pub fn run(initial: Option<String>) -> eframe::Result {
             .with_app_id("playr")
             .with_icon(std::sync::Arc::new(window_icon()))
             .with_inner_size([960.0, 600.0])
-            .with_min_inner_size([420.0, 260.0])
+            .with_min_inner_size(corner::NORMAL_MIN_INNER)
             .with_drag_and_drop(true),
         renderer: eframe::Renderer::Glow,
         ..Default::default()

@@ -78,6 +78,43 @@ Run ((Sine 4) + @('-af', "aselect='not(between(t,1.5,2.5))'", '-c:a', 'libvorbis
 # Bare MPEG frames (no ID3 tag, no Xing header), as an Icecast server would send them.
 Run ((Sine 4) + @('-c:a', 'libmp3lame', '-b:a', '64k', '-id3v2_version', '0', '-write_xing', '0') + $bitexact + "$here\radio.mp3")
 
+# --- HLS (tests/hls_*.rs) ------------------------------------------------------------------
+# 160x120 picture with a keyframe every second and no B-frames, cut into 1 s segments, so
+# segment n holds pictures 25n..25n+24 and starts at n seconds.
+$hlsRoot = "$here\hls"
+$gop1s = @('-bf', '0', '-g', '25', '-keyint_min', '25', '-sc_threshold', '0')
+$hlsVod = @('-f', 'hls', '-hls_time', '1', '-hls_playlist_type', 'vod')
+function Hls([string]$name, [string[]]$encode, [string[]]$extra = @(), [string]$ext = 'ts') {
+    $dir = "$hlsRoot\$name"
+    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    # FFmpeg writes the fMP4 init section relative to the working directory.
+    Push-Location $dir
+    try { Run ($encode + $bitexact + $hlsVod + $extra + @('-hls_segment_filename', "seg%d.$ext", 'index.m3u8')) } finally { Pop-Location }
+}
+# H.264 + AAC in MPEG-TS, 6 segments (also played as a live stream that grows).
+Hls 'ts' ((Video 6 '160x120') + (Sine 6) + $x264 + $gop1s + $aac)
+# HEVC + AAC in MPEG-TS, 2 segments.
+Hls 'hevc' ((Video 2 '160x120') + (Sine 2) + @('-c:v', 'libx265', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-x265-params', 'log-level=error:info=0:keyint=25:min-keyint=25:scenecut=0:bframes=0') + $aac)
+# Fragmented MP4 after an EXT-X-MAP header, 4 segments.
+Hls 'fmp4' ((Video 4 '160x120') + (Sine 4) + $x264 + $gop1s + $aac) @('-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4') 'm4s'
+# Picture only and sound only, for a master playlist with a separate audio rendition.
+Hls 'video_only' ((Video 4 '160x120') + $x264 + $gop1s + @('-an'))
+Hls 'audio_only' ((Sine 4) + $aac + @('-vn'))
+# MP3 sound only in MPEG-TS, 2 segments.
+Hls 'mp3_ts' ((Sine 2) + @('-c:a', 'libmp3lame', '-b:a', '64k', '-vn'))
+# AES-128 encrypted by FFmpeg: key.bin is 2b7e151628aed2a6abf7158809cf4f3c (the FIPS-197 example
+# key), the IV 000102030405060708090a0b0c0d0e0f is named in the playlist. (FFmpeg always writes
+# the IV, so the tests encrypt their own segments for the IV-from-sequence-number case.)
+$hlsKey = [byte[]](0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c)
+$keyInfo = Join-Path ([IO.Path]::GetTempPath()) 'playr_hls_aes.keyinfo'
+$keyFile = Join-Path ([IO.Path]::GetTempPath()) 'playr_hls_aes.key'
+[IO.File]::WriteAllBytes($keyFile, $hlsKey)
+Set-Content -Path $keyInfo -Value @('key.bin', $keyFile, '000102030405060708090a0b0c0d0e0f') -Encoding ascii
+Hls 'aes' ((Video 2 '160x120') + (Sine 2) + $x264 + $gop1s + $aac) @('-hls_key_info_file', $keyInfo)
+[IO.File]::WriteAllBytes("$hlsRoot\aes\key.bin", $hlsKey)
+Remove-Item $keyInfo, $keyFile
+
 # --- reference data from FFmpeg's own decoders ---------------------------------------------
 # <name>.framecrc: Adler-32 and timestamp of every decoded picture (planar yuv420p).
 # <name>.f0.yuv / .f37.yuv: the raw planes of pictures 0 and 37 (an inter-coded one).

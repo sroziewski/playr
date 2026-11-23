@@ -51,7 +51,7 @@ pub trait RangeFetch: Send + Sync {
 }
 
 /// The HTTP client every playr download outside the radio path uses.
-pub fn agent() -> ureq::Agent {
+pub fn agent_with(https_only: bool) -> ureq::Agent {
     // rustls is built without a bundled crypto backend; installing the pure-Rust one a second
     // time is a harmless error.
     let _ = rustls_rustcrypto::provider().install_default();
@@ -59,6 +59,7 @@ pub fn agent() -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(20)))
         .max_redirects(8)
+        .https_only(https_only)
         .user_agent("playr/0.1")
         .build()
         .into()
@@ -66,11 +67,13 @@ pub fn agent() -> ureq::Agent {
 
 /// Reads a whole (small) text resource, at most `limit` bytes of it.
 pub fn get_text(url: &str, headers: &[(String, String)], limit: u64) -> Result<String, String> {
-    let mut req = agent().get(url);
-    for (name, value) in headers {
-        req = req.header(name.as_str(), value.as_str());
-    }
-    let resp = req.call().map_err(|e| format!("cannot download {}: {e}", short(url)))?;
+    let resp = crate::privacy::fetch(url, |a| {
+        let mut req = agent_with(a.https_only).get(&a.url);
+        for (name, value) in headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        req.call().map_err(|e| format!("cannot download {}: {e}", short(&a.url)))
+    })?;
     let mut raw = Vec::new();
     resp.into_body()
         .into_reader()
@@ -101,8 +104,17 @@ pub struct HttpFetch {
 impl HttpFetch {
     /// Connects and reads the first `head` bytes, which also reveals the file's length.
     pub fn connect(url: &str, headers: &[(String, String)], head: u64) -> Result<(Self, Vec<u8>), String> {
-        let mut fetch =
-            Self { agent: agent(), url: std::sync::Mutex::new(url.to_string()), origin: url.to_string(), headers: headers.to_vec(), len: 0 };
+        crate::privacy::fetch(url, |a| Self::connect_once(&a.url, a.https_only, headers, head))
+    }
+
+    fn connect_once(url: &str, https_only: bool, headers: &[(String, String)], head: u64) -> Result<(Self, Vec<u8>), String> {
+        let mut fetch = Self {
+            agent: agent_with(https_only),
+            url: std::sync::Mutex::new(url.to_string()),
+            origin: url.to_string(),
+            headers: headers.to_vec(),
+            len: 0,
+        };
         let resp = fetch.request_at(url, 0, head)?;
         let total = resp
             .headers()
@@ -119,6 +131,10 @@ impl HttpFetch {
             .read_to_end(&mut bytes)
             .map_err(|e| format!("cannot download {}: {e}", short(url)))?;
         Ok((fetch, bytes))
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        !crate::privacy::is_unencrypted(&self.url.lock().unwrap())
     }
 
     fn request(&self, from: u64, to: u64) -> Result<ureq::http::Response<ureq::Body>, String> {
@@ -759,6 +775,10 @@ impl MergedDemuxer {
 impl Demuxer for MergedDemuxer {
     fn info(&self) -> &MediaInfo {
         &self.info
+    }
+
+    fn unencrypted(&self) -> bool {
+        self.video.unencrypted() || self.audio.unencrypted()
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>, String> {

@@ -60,6 +60,84 @@ pub fn video_id(url: &str) -> Option<String> {
     valid.then(|| candidate.to_string())
 }
 
+pub fn list_id(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let (path, query) = path.split_once('?')?;
+    let page = match host {
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" => matches!(path, "watch" | "playlist"),
+        "youtu.be" => video_id(url).is_some(),
+        _ => false,
+    };
+    if !page {
+        return None;
+    }
+    let query = query.split('#').next().unwrap_or(query);
+    let id = query.split('&').find_map(|kv| kv.strip_prefix("list="))?;
+    let valid = id.len() >= 2 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then(|| id.to_string())
+}
+
+pub fn page_info(url: &str, abort: &AtomicBool, progress: &dyn Fn(&str)) -> Result<String, String> {
+    let exe = ytdlp_candidates(progress).into_iter().next().map(|(exe, _)| exe).ok_or("playing web videos needs yt-dlp, which could not be downloaded")?;
+    progress("Asking yt-dlp about the page…");
+    run_quiet(&exe, &["-J", "--no-playlist", "--no-warnings", "--no-progress", "--", url], YTDLP_TIMEOUT, abort)
+}
+
+pub fn plays_video_when_list_unread(url: &str, aborted: bool) -> bool {
+    video_id(url).is_some() && !aborted
+}
+
+pub fn is_youtube_list_url(url: &str) -> bool {
+    list_id(url).is_some()
+}
+
+pub fn parse_playlist(json: &str) -> Result<Option<crate::spotify::Playlist>, String> {
+    let data: Value = serde_json::from_str(json).map_err(|e| format!("yt-dlp sent an unreadable playlist ({e})"))?;
+    if data.get("_type").and_then(Value::as_str) != Some("playlist") {
+        return Ok(None);
+    }
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let entries: Vec<crate::spotify::Entry> = data
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|e| {
+                    let id = text(e, "id").filter(|id| id.len() == 11)?;
+                    Some(crate::spotify::Entry {
+                        title: text(e, "title").unwrap_or_else(|| id.clone()),
+                        subtitle: text(e, "channel").or_else(|| text(e, "uploader")).unwrap_or_default(),
+                        duration: e.get("duration").and_then(Value::as_f64).filter(|d| *d > 0.0),
+                        audio: Some(format!("https://www.youtube.com/watch?v={id}")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let name = text(&data, "title").unwrap_or_else(|| "YouTube playlist".into());
+    Ok(Some(crate::spotify::Playlist { name, entries, start: 0 }))
+}
+
+pub fn playlist(url: &str, abort: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Option<crate::spotify::Playlist>, String> {
+    let exe = ytdlp_candidates(progress).into_iter().next().map(|(exe, _)| exe).ok_or("playing YouTube needs yt-dlp, which could not be downloaded")?;
+    progress("Reading the YouTube playlist…");
+    let args = ["-J", "--flat-playlist", "--yes-playlist", "--playlist-end", "200", "--no-warnings", "--no-progress", "--", url];
+    let Some(mut list) = parse_playlist(&run_quiet(&exe, &args, YTDLP_TIMEOUT, abort)?)? else { return Ok(None) };
+    if let Some(id) = video_id(url) {
+        let wanted = format!("https://www.youtube.com/watch?v={id}");
+        list.start = list.entries.iter().position(|e| e.audio.as_deref() == Some(wanted.as_str())).unwrap_or(0);
+    }
+    Ok(Some(list))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoFormat {
     pub id: String,
@@ -216,8 +294,29 @@ pub fn parse_info(json: &str) -> Result<Video, String> {
     let formats = v.get("formats").and_then(Value::as_array).cloned().unwrap_or_default();
     let is = |f: &Value, key: &str, want: &str| f.get(key).and_then(Value::as_str) == Some(want);
 
+    let live = v.get("is_live").and_then(Value::as_bool).unwrap_or(false);
     let mut video: Vec<VideoFormat> = Vec::new();
-    for f in &formats {
+    // A broadcast comes only as HLS, each quality with its picture and sound together.
+    for f in formats.iter().filter(|_| live) {
+        let hls = f.get("protocol").and_then(Value::as_str).is_some_and(|p| p.starts_with("m3u8"));
+        let avc = f.get("vcodec").and_then(Value::as_str).is_some_and(|c| c.starts_with("avc1"));
+        let aac = f.get("acodec").and_then(Value::as_str).is_some_and(|c| c.starts_with("mp4a"));
+        let (Some(id), Some(url), Some(height)) = (text(f, "format_id"), text(f, "url"), number(f, "height")) else {
+            continue;
+        };
+        if !(hls && avc && aac) || video.iter().any(|g| g.height == height as u32) {
+            continue;
+        }
+        video.push(VideoFormat {
+            id,
+            url,
+            width: number(f, "width").unwrap_or(0.0) as u32,
+            height: height as u32,
+            fps: number(f, "fps").unwrap_or(0.0),
+            bitrate: number(f, "tbr").unwrap_or(0.0),
+        });
+    }
+    for f in formats.iter().filter(|_| !live) {
         let avc = f.get("vcodec").and_then(Value::as_str).is_some_and(|c| c.starts_with("avc1"));
         if !(avc && is(f, "acodec", "none") && is(f, "protocol", "https") && is(f, "ext", "mp4")) {
             continue;
@@ -317,7 +416,6 @@ pub fn parse_info(json: &str) -> Result<Video, String> {
         .and_then(Value::as_object)
         .map(|h| h.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
         .unwrap_or_default();
-    let live = v.get("is_live").and_then(Value::as_bool).unwrap_or(false);
     Ok(Video {
         id: text(&v, "id").unwrap_or_default(),
         title: text(&v, "title").unwrap_or_else(|| "YouTube video".into()),
@@ -333,8 +431,8 @@ pub fn parse_info(json: &str) -> Result<Video, String> {
 
 /// Why a video that yt-dlp could read still has nothing playr can play, or `None` when it has.
 pub fn unplayable_reason(video: &Video) -> Option<String> {
-    if video.live {
-        return Some("YouTube live streams are not supported (YouTube sends them only as HLS)".into());
+    if video.live && video.video.is_empty() {
+        return Some("YouTube offers this live stream in no format playr can play".into());
     }
     if video.video.is_empty() && video.audio.is_empty() {
         return Some("YouTube offers no H.264 or AAC stream for this video".into());
@@ -352,6 +450,15 @@ pub struct Opened {
 /// picture is not downloaded at all, so the video plays like a radio station; a video without
 /// any sound stream is still opened with its picture.
 pub fn open(video: &Video, choice: &Choice, audio_only: bool, abort: Arc<AtomicBool>) -> Result<Opened, String> {
+    if video.live {
+        let (v, _) = video.pick(choice);
+        // Sound only still needs one of the qualities; the smallest costs the least to fetch.
+        let v = if audio_only { video.video.last() } else { v };
+        let v = v.ok_or_else(|| unplayable_reason(video).unwrap_or_else(|| "no playable stream".into()))?;
+        let opened = crate::hls::open(&crate::hls::Location::Url(v.url.clone()), None, &video.headers, audio_only, abort)?;
+        let choice = Choice { video: (!audio_only).then(|| v.id.clone()), audio: None };
+        return Ok(Opened { demuxer: opened.demuxer, choice });
+    }
     let (v, a) = video.pick(choice);
     let v = v.filter(|_| !(audio_only && a.is_some()));
     // The two streams come from different servers; each costs a few round trips to open.
@@ -434,10 +541,9 @@ pub fn download_ytdlp(dest: &Path) -> Result<(), String> {
 pub fn download_ytdlp_from(base: &str, asset: &str, dest: &Path) -> Result<(), String> {
     let sums = dash::get_text(&format!("{base}SHA2-256SUMS"), &[], 1 << 20)?;
     let expected = expected_sha256(&sums, asset).ok_or("the yt-dlp release lists no checksum for this system")?;
-    let resp = dash::agent()
-        .get(&format!("{base}{asset}"))
-        .call()
-        .map_err(|e| format!("cannot download yt-dlp: {e}"))?;
+    let resp = crate::privacy::fetch(&format!("{base}{asset}"), |a| {
+        dash::agent_with(a.https_only).get(&a.url).call().map_err(|e| format!("cannot download yt-dlp: {e}"))
+    })?;
     let mut bytes = Vec::new();
     resp.into_body()
         .into_reader()

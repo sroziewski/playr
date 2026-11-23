@@ -12,7 +12,7 @@ pub const DEFAULT_STEP: usize = 2;
 /// Skips this close together add up (see [`SkipChain`]).
 pub const CHAIN_WINDOW: Duration = Duration::from_millis(1500);
 
-pub const SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+pub const SPEEDS: [f64; 11] = [0.25, 0.5, 0.75, 1.0, 1.05, 1.1, 1.15, 1.25, 1.5, 1.75, 2.0];
 
 pub fn speed_label(speed: f64) -> String {
     format!("{}×", (speed * 100.0).round() / 100.0)
@@ -33,6 +33,64 @@ pub fn speed_after(current: f64, delta: isize) -> f64 {
         }
     }
     if delta == 0 { current } else { speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageClick {
+    Nothing,
+    TogglePause,
+    Fullscreen,
+    FullscreenAndUndoPause,
+}
+
+pub fn stage_click(clicked: bool, double_clicked: bool, playing: bool, last_click_paused: bool) -> StageClick {
+    match (double_clicked, clicked && playing) {
+        (true, _) if playing && last_click_paused => StageClick::FullscreenAndUndoPause,
+        (true, _) => StageClick::Fullscreen,
+        (false, true) => StageClick::TogglePause,
+        (false, false) => StageClick::Nothing,
+    }
+}
+
+pub fn stage_step(
+    last_click_paused: &mut bool,
+    clicked: bool,
+    double_clicked: bool,
+    allowed: bool,
+    playing: bool,
+) -> StageClick {
+    let action = stage_click(clicked && allowed, double_clicked && allowed, playing, *last_click_paused);
+    if clicked {
+        *last_click_paused = action == StageClick::TogglePause;
+    }
+    action
+}
+
+pub fn stage_input_allowed(url_dialog_open: bool, popup_open: bool) -> bool {
+    !url_dialog_open && !popup_open
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Back {
+    Restart,
+    Previous,
+    Disabled,
+}
+
+pub const RESTART_AFTER_SECS: f64 = 3.0;
+
+pub fn back_action(position: f64, seekable: bool, entry: usize) -> Back {
+    if seekable && position > RESTART_AFTER_SECS {
+        Back::Restart
+    } else if entry > 0 {
+        Back::Previous
+    } else {
+        Back::Disabled
+    }
+}
+
+pub fn history_item_enabled(target: &str, exists: Option<bool>) -> bool {
+    crate::net::is_url(target) || exists != Some(false)
 }
 
 pub fn pasted_target(text: &str) -> Option<String> {
