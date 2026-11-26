@@ -47,6 +47,8 @@ const ALIGN_TOLERANCE_SECS: f64 = 0.01;
 const AUDIO_FAILURES_BEFORE_NOTE: u32 = 50;
 /// How many times a lost output device is reopened before audio is given up.
 const MAX_DEVICE_REOPENS: u32 = 5;
+/// How long the last picture of a list entry waits to be drawn before the next entry opens.
+const LAST_PICTURE_GRACE: Duration = Duration::from_millis(250);
 const YOUTUBE_CACHE_FOR: Duration = Duration::from_secs(3600);
 pub const MIN_SPEED: f64 = 0.25;
 pub const MAX_SPEED: f64 = 2.0;
@@ -102,7 +104,7 @@ pub struct Shared {
     /// stalled network read that the pipeline thread is blocked in.
     abort: Mutex<Arc<AtomicBool>>,
     youtube_cache: Mutex<Option<(String, Instant, Arc<Video>)>>,
-    youtube_audio_only: AtomicBool,
+    audio_only: AtomicBool,
     list_cache: Mutex<Option<(String, Instant, Option<Arc<Playlist>>)>>,
     spotify_next: Mutex<Option<Prefetched>>,
     skipped: Mutex<Vec<String>>,
@@ -123,7 +125,7 @@ impl Shared {
             force_show: AtomicBool::new(false),
             abort: Mutex::new(Arc::new(AtomicBool::new(false))),
             youtube_cache: Mutex::new(None),
-            youtube_audio_only: AtomicBool::new(false),
+            audio_only: AtomicBool::new(false),
             list_cache: Mutex::new(None),
             spotify_next: Mutex::new(None),
             skipped: Mutex::new(Vec::new()),
@@ -137,6 +139,13 @@ impl Shared {
 
     pub fn bitrate(&self) -> Option<Rate> {
         self.bitrate.lock().unwrap().rate(self.position())
+    }
+
+    /// Seconds of media read beyond the playing position; negative when the clock is past
+    /// everything read.
+    pub fn read_ahead(&self) -> Option<f64> {
+        let newest = self.bitrate.lock().unwrap().newest()?;
+        Some(newest - self.position())
     }
 
     pub fn status(&self) -> Status {
@@ -168,7 +177,7 @@ impl Shared {
     pub fn position(&self) -> f64 {
         let c = self.clock.lock().unwrap();
         if c.use_audio {
-            c.base + self.audio.played_secs()
+            c.base + self.audio.heard_secs()
         } else {
             c.base + c.wall_accum + c.wall_anchor.map_or(0.0, |t| t.elapsed().as_secs_f64() * c.speed)
         }
@@ -194,8 +203,8 @@ impl Shared {
         self.clock.lock().unwrap().speed
     }
 
-    pub fn youtube_audio_only(&self) -> bool {
-        self.youtube_audio_only.load(Ordering::Relaxed)
+    pub fn audio_only(&self) -> bool {
+        self.audio_only.load(Ordering::Relaxed)
     }
 
     pub fn cookies_path(&self) -> Option<PathBuf> {
@@ -269,6 +278,31 @@ impl Shared {
         }
         let next = q.front().map(|f| (f.pts - pos).max(0.0));
         (latest, next)
+    }
+
+    /// Drops queued pictures that a later queued picture has already replaced (both are due),
+    /// keeping the newest due one for the screen. The UI does the same when it draws, but it
+    /// does not draw while Windows withholds repaints from a covered window, or while a window
+    /// is being dragged; without this the full queue would stop decoding, then reading, and
+    /// the sound would run dry.
+    pub fn drop_stale_frames(&self) {
+        // Reading the clock takes the audio callback's lock; not every step needs to.
+        if self.frames_len() < 2 {
+            return;
+        }
+        let pos = self.position();
+        let mut q = self.frames.lock().unwrap();
+        while q.get(1).is_some_and(|f| f.pts <= pos + 0.002) {
+            q.pop_front();
+        }
+    }
+
+    /// Queued pictures not yet due. The end of the media is reached once none are left: a due
+    /// picture is shown when the window next draws, which may not be soon (see
+    /// [`drop_stale_frames`](Self::drop_stale_frames)).
+    fn undue_frames(&self) -> usize {
+        let pos = self.position();
+        self.frames.lock().unwrap().iter().filter(|f| f.pts > pos + 0.002).count()
     }
 
     fn abort_current(&self) {
@@ -362,8 +396,8 @@ impl Player {
         self.shared.set_speed(speed);
     }
 
-    pub fn set_youtube_audio_only(&self, on: bool) {
-        self.shared.youtube_audio_only.store(on, Ordering::Relaxed);
+    pub fn set_audio_only(&self, on: bool) {
+        self.shared.audio_only.store(on, Ordering::Relaxed);
     }
 
     pub fn seek(&self, secs: f64) {
@@ -410,7 +444,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     // this media, not the pipeline thread (which would leave the UI dead).
                     Err(TryRecvError::Empty) => match catch_unwind(AssertUnwindSafe(|| s.step(&shared))) {
                         Ok(true) => None,
-                        Ok(false) if s.finished && s.advance.is_some() => {
+                        Ok(false) if s.finished && s.advance.is_some() && s.last_picture_had_its_chance(&shared) => {
                             if let Some(e) = shared.status().error.filter(|_| shared.status().state == State::Failed) {
                                 shared.skipped.lock().unwrap().push(format!("the previous entry broke off: {e}"));
                             }
@@ -664,6 +698,36 @@ fn resolve_page(shared: &Arc<Shared>, url: &str, abort: &Arc<AtomicBool>) -> Res
     Ok(page)
 }
 
+struct PageOpened {
+    demuxer: Box<dyn Demuxer>,
+    secure: bool,
+    page: Arc<Page>,
+    choice: Choice,
+    finite: bool,
+}
+
+/// Opens a web page's video through yt-dlp: the chosen quality, or its sound alone when
+/// [`Shared::audio_only`] is on.
+fn open_page(shared: &Arc<Shared>, url: &str, choice: Option<&Choice>, abort: &Arc<AtomicBool>) -> Result<PageOpened, String> {
+    let page = resolve_page(shared, url, abort)?;
+    let sound = shared.audio_only().then(|| page.sound_format()).flatten();
+    let sound_only = sound.is_some();
+    let (format, (demuxer, secure)) = match sound {
+        Some(format) => {
+            let opened = sites::open_sound(&page, &format, abort.clone())?;
+            (format, opened)
+        }
+        None => {
+            let format = page.pick(choice.and_then(|c| c.video.as_deref())).cloned().ok_or("the page has no video")?;
+            let opened = sites::open(&page, &format, abort.clone())?;
+            (format, opened)
+        }
+    };
+    let finite = !format.hls || demuxer.info().duration.is_some();
+    let choice = Choice { video: (!sound_only).then(|| format.id.clone()), audio: None };
+    Ok(PageOpened { demuxer, secure, page, choice, finite })
+}
+
 fn ytdlp_cookies(shared: &Shared) -> Option<PathBuf> {
     cookies::ytdlp_copy(&*shared.cookie_jar()?)
 }
@@ -809,6 +873,7 @@ struct Session {
     advance: Option<(String, usize)>,
     /// The note that something came over plain HTTP is shown.
     told_unencrypted: bool,
+    finished_at: Option<Instant>,
 }
 
 impl Drop for Session {
@@ -868,7 +933,7 @@ impl Session {
                 Some(link) if youtube::is_youtube_url(link) => {
                     let video = resolve_youtube(shared, link, &abort)?;
                     let opened =
-                        youtube::open(&video, choice.unwrap_or(&Choice::default()), shared.youtube_audio_only(), abort.clone())?;
+                        youtube::open(&video, choice.unwrap_or(&Choice::default()), shared.audio_only(), abort.clone())?;
                     chosen = opened.choice;
                     video_info = Some(video);
                     opened.demuxer
@@ -908,12 +973,20 @@ impl Session {
             demuxer
         } else if youtube::is_youtube_url(&target) {
             let video = resolve_youtube(shared, &target, &abort)?;
-            let audio_only = shared.youtube_audio_only();
+            let audio_only = shared.audio_only();
             let opened = youtube::open(&video, choice.unwrap_or(&Choice::default()), audio_only, abort.clone())?;
             title = video.title.clone();
             finite = !video.live;
             chosen = opened.choice;
             video_info = Some(video);
+            opened.demuxer
+        } else if sites::is_pornhub_url(&target) {
+            let opened = open_page(shared, &target, choice, &abort)?;
+            unencrypted = !opened.secure;
+            title = opened.page.title.clone();
+            finite = opened.finite;
+            chosen = opened.choice;
+            page_info = Some(opened.page);
             opened.demuxer
         } else if live {
             let cb_shared = shared.clone();
@@ -933,15 +1006,13 @@ impl Session {
             } else if sites::is_html(stream.mime.as_deref()) {
                 let stream_secure = stream.secure;
                 drop(stream);
-                let page = resolve_page(shared, &target, &abort)?;
-                let format = page.pick(choice.and_then(|c| c.video.as_deref())).cloned().ok_or("the page has no video")?;
-                let (demuxer, secure) = sites::open(&page, &format, abort.clone())?;
-                unencrypted = !stream_secure || !secure;
-                title = page.title.clone();
-                finite = !format.hls || demuxer.info().duration.is_some();
-                chosen = Choice { video: Some(format.id.clone()), audio: None };
-                page_info = Some(page);
-                demuxer
+                let opened = open_page(shared, &target, choice, &abort)?;
+                unencrypted = !stream_secure || !opened.secure;
+                title = opened.page.title.clone();
+                finite = opened.finite;
+                chosen = opened.choice;
+                page_info = Some(opened.page);
+                opened.demuxer
             } else {
                 unencrypted = !stream.secure;
                 if let Some(name) = stream.name {
@@ -1006,7 +1077,7 @@ impl Session {
         };
         if let Some(t) = &vtrack {
             summary.push_str(&format!(" · {} {}×{}", t.codec.name(), t.width, t.height));
-        } else if video_info.is_some() {
+        } else if video_info.is_some() || page_info.is_some() {
             summary.push_str(" · sound only");
         }
         if let Some((list, index)) = &playlist {
@@ -1079,6 +1150,7 @@ impl Session {
             abort,
             advance,
             told_unencrypted,
+            finished_at: None,
         })
     }
 
@@ -1086,7 +1158,9 @@ impl Session {
     /// it at once; the timeout only bounds how late it notices that the UI resumed playback
     /// or consumed pictures.
     fn idle_wait(&self, shared: &Shared) -> Duration {
-        if self.finished {
+        if self.finished && self.advance.is_some() {
+            Duration::from_millis(20)
+        } else if self.finished {
             Duration::from_millis(500)
         } else if shared.is_paused() {
             Duration::from_millis(50)
@@ -1095,12 +1169,20 @@ impl Session {
         }
     }
 
+    /// Whether the next list entry may be opened, which clears the pictures: once the window
+    /// has drawn the last one, or after [`LAST_PICTURE_GRACE`] (a covered window may not draw
+    /// at all).
+    fn last_picture_had_its_chance(&self, shared: &Shared) -> bool {
+        shared.frames_len() == 0 || self.finished_at.is_some_and(|t| t.elapsed() >= LAST_PICTURE_GRACE)
+    }
+
     /// Does one unit of work. Returns `false` when every buffer is full (or the media is
     /// finished), which tells the caller to sleep.
     fn step(&mut self, shared: &Arc<Shared>) -> bool {
         if self.out.is_some() && shared.audio.take_device_error() {
             self.on_device_lost(shared);
         }
+        shared.drop_stale_frames();
         let high = if self.live { AUDIO_BUFFER_LIVE } else { AUDIO_BUFFER_FILE };
         let need_a = self.adec.is_some() && shared.audio.buffered_secs() < high;
         let need_v = (self.vdec.is_some() || !self.tail.is_empty()) && shared.frames_len() < FRAME_QUEUE;
@@ -1244,8 +1326,9 @@ impl Session {
             return;
         }
         let audio_done = self.out.is_none() || shared.audio.buffered_frames() == 0;
-        if audio_done && shared.frames_len() == 0 {
+        if audio_done && shared.undue_frames() == 0 {
             self.finished = true;
+            self.finished_at = Some(Instant::now());
             shared.set_paused(true);
             let lost = self.live && !self.finite;
             // A file that broke before anything could be shown or heard did not play.

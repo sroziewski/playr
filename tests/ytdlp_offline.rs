@@ -356,10 +356,10 @@ fn player_opens_youtube_with_or_without_the_picture_and_asks_ytdlp_once_per_vide
     let player = Player::new(Box::new(|| {}));
     player.shared.audio.set_volume(0.0);
 
-    player.set_youtube_audio_only(true);
+    player.set_audio_only(true);
     let sound = open_and_wait(&player);
     let picture_requests_while_sound_only = server.requests().iter().filter(|r| r.path == "/v.mp4").count();
-    player.set_youtube_audio_only(false);
+    player.set_audio_only(false);
     let both = open_and_wait(&player);
     player.stop();
 

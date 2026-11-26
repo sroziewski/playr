@@ -7,14 +7,38 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::stretch::Stretcher;
 
+/// A buffer the device callback filled: where its sound sits in the media and when the
+/// device starts playing it.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    /// Media frames played before this buffer.
+    start: u64,
+    /// Media frames in it (fewer than its length when audio ran short, scaled by the speed).
+    media: u64,
+    /// Output frames at its front that carry that media; the rest is silence.
+    sounding: u64,
+    /// When its first sample reaches the speaker.
+    at: Instant,
+}
+
+/// Output latency above this is taken for a bogus device report and ignored.
+const MAX_LATENCY: Duration = Duration::from_secs(2);
+/// Buffers remembered while they are on their way to the speaker: latency / buffer length of
+/// them, usually a handful; enough for [`MAX_LATENCY`] at 2 ms buffers. Allocated up front,
+/// so the device callback never allocates.
+const IN_FLIGHT: usize = 1024;
+
 pub struct AudioShared {
     buf: Mutex<(VecDeque<f32>, Stretcher)>,
     played_frames: AtomicU64,
+    /// Buffers handed to the device, oldest first, back to the one now being heard.
+    in_flight: Mutex<VecDeque<InFlight>>,
     channels: AtomicU32,
     rate: AtomicU32,
     paused: AtomicBool,
@@ -33,6 +57,7 @@ impl Default for AudioShared {
         Self {
             buf: Mutex::new((VecDeque::new(), Stretcher::default())),
             played_frames: AtomicU64::new(0),
+            in_flight: Mutex::new(VecDeque::with_capacity(IN_FLIGHT)),
             channels: AtomicU32::new(2),
             rate: AtomicU32::new(48000),
             paused: AtomicBool::new(false),
@@ -130,17 +155,46 @@ impl AudioShared {
         self.played_frames.load(Ordering::Relaxed) as f64 / self.rate() as f64
     }
 
+    /// Seconds of the media heard from the speaker by now: what the device has consumed, less
+    /// what is still on its way out (its output latency and the buffer it is playing). This is
+    /// the clock pictures are shown by; [`played_secs`](Self::played_secs) would put them
+    /// ahead of the sound by that latency.
+    pub fn heard_secs(&self) -> f64 {
+        self.heard_secs_at(Instant::now())
+    }
+
+    /// [`heard_secs`](Self::heard_secs) at `now`.
+    pub fn heard_secs_at(&self, now: Instant) -> f64 {
+        let in_flight = self.in_flight.lock().unwrap();
+        let rate = self.rate() as f64;
+        let Some(first) = in_flight.front() else { return self.played_secs() };
+        // The buffer being heard is the newest one that has reached the speaker. Its sound
+        // plays at its own pace from its front; after that (silence, or a pause) the clock
+        // waits for the next buffer, which starts where this one ended.
+        let Some(b) = in_flight.iter().rev().find(|b| b.at <= now) else { return first.start as f64 / rate };
+        let into = (now - b.at).as_secs_f64() * rate;
+        let within = if b.sounding == 0 { 0.0 } else { into.min(b.sounding as f64) * b.media as f64 / b.sounding as f64 };
+        (b.start as f64 + within) / rate
+    }
+
     /// Drops everything queued and restarts the frame count (used on open and on seek).
     pub fn reset(&self) {
         let mut queue = self.buf.lock().unwrap();
         queue.0.clear();
         queue.1.reset();
         self.played_frames.store(0, Ordering::Relaxed);
+        self.in_flight.lock().unwrap().clear();
     }
 
     /// The device callback: fills `out` (interleaved, [`channels`](Self::channels) wide) and
     /// advances the clock by what was really played.
     pub fn render(&self, out: &mut [f32]) {
+        self.render_at(out, Instant::now(), Duration::ZERO);
+    }
+
+    /// [`render`](Self::render) called at `now` for a buffer the device starts playing
+    /// `latency` later.
+    pub fn render_at(&self, out: &mut [f32], now: Instant, latency: Duration) {
         let channels = self.channels().max(1);
         if self.is_paused() {
             out.fill(0.0);
@@ -171,10 +225,20 @@ impl AudioShared {
             *sample *= gain;
         }
         out[filled..].fill(0.0);
+        let mut sounding = (filled / channels) as u64;
         if self.is_free_run() {
             frames = ((out.len() / channels) as f64 * speed).round() as u64;
+            // Free running is the clock going on without sound: over the whole buffer.
+            sounding = (out.len() / channels) as u64;
         }
-        self.played_frames.fetch_add(frames, Ordering::Relaxed);
+        let start = self.played_frames.fetch_add(frames, Ordering::Relaxed);
+        let latency = if latency > MAX_LATENCY { Duration::ZERO } else { latency };
+        let mut in_flight = self.in_flight.lock().unwrap();
+        // Buffers wholly superseded by a later one already being heard are forgotten.
+        while in_flight.get(1).is_some_and(|b| b.at <= now) || in_flight.len() >= IN_FLIGHT {
+            in_flight.pop_front();
+        }
+        in_flight.push_back(InFlight { start, media: frames, sounding, at: now + latency });
     }
 }
 
@@ -272,7 +336,10 @@ impl AudioOut {
             let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
             device.build_output_stream(
                 config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| cb_shared.render(data),
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let t = info.timestamp();
+                    cb_shared.render_at(data, Instant::now(), t.playback.duration_since(t.callback));
+                },
                 // After an error the callback may never run again, which would freeze the
                 // clock; the pipeline reopens the device when it sees this flag.
                 move |_err| err_shared.flag_device_error(),

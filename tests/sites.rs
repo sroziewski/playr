@@ -20,7 +20,9 @@ use common::http::{RadioServer, STATION};
 use common::range_http::{Mode, RangeServer};
 use common::{finish, fixture_bytes};
 use playr::player::{Player, State, Status};
-use playr::sites::{Format, Page, is_html, parse_page, unplayable_reason};
+use playr::demux::{Demuxer, SoundOnly};
+use playr::media::{MediaInfo, Packet};
+use playr::sites::{Format, Page, SOUND_ONLY_ID, is_html, is_pornhub_url, parse_page, unplayable_reason};
 use playr::youtube::Choice;
 use serde_json::{Value, json};
 
@@ -314,6 +316,203 @@ fn only_html_pages_are_pages() {
     let actual: Vec<(Option<&str>, bool)> = cases.iter().map(|&(m, _)| (m, is_html(m))).collect();
 
     assert_eq!(actual, cases);
+}
+
+#[test]
+fn the_sound_of_a_page_is_its_hls_sound_stream_or_else_its_smallest_format() {
+    let sized = |id: &str, height: Option<u32>, tbr: Option<f64>| Format { tbr, ..format(id, height) };
+    let with_sound = Format { hls: true, audio: Some("https://cdn.example/a128.m3u8".into()), ..sized("hls-720", Some(720), Some(2500.0)) };
+    let hls_sound = Format {
+        id: "sound".into(),
+        url: "https://cdn.example/a128.m3u8".into(),
+        ext: None,
+        width: None,
+        height: None,
+        tbr: None,
+        hls: true,
+        audio: None,
+    };
+    let cases: Vec<(&str, Vec<Format>, Option<Format>)> = vec![
+        ("an HLS sound stream wins over a smaller file", vec![sized("http-240", Some(240), Some(300.0)), with_sound.clone()], Some(hls_sound)),
+        (
+            "the lowest height",
+            vec![sized("720", Some(720), Some(100.0)), sized("240", Some(240), Some(900.0)), sized("480", Some(480), Some(50.0))],
+            Some(sized("240", Some(240), Some(900.0))),
+        ),
+        (
+            "of equal heights the lower bitrate",
+            vec![sized("360-hi", Some(360), Some(900.0)), sized("360-lo", Some(360), Some(500.0)), sized("720", Some(720), Some(100.0))],
+            Some(sized("360-lo", Some(360), Some(500.0))),
+        ),
+        (
+            "an unknown height counts as the tallest",
+            vec![sized("unknown", None, Some(100.0)), sized("2160", Some(2160), Some(20_000.0))],
+            Some(sized("2160", Some(2160), Some(20_000.0))),
+        ),
+        (
+            "an unknown bitrate counts as the highest",
+            vec![sized("360-unknown", Some(360), None), sized("360-700", Some(360), Some(700.0))],
+            Some(sized("360-700", Some(360), Some(700.0))),
+        ),
+        (
+            "neither known: the one with a bitrate",
+            vec![sized("bare", None, None), sized("rated", None, Some(50.0))],
+            Some(sized("rated", None, Some(50.0))),
+        ),
+        ("a single format", vec![sized("only", Some(480), Some(800.0))], Some(sized("only", Some(480), Some(800.0)))),
+        ("no formats", vec![], None),
+    ];
+    let mut bad = Vec::new();
+    for (case, formats, expected) in cases {
+        let actual = page(formats).sound_format();
+        expect!(bad, actual == expected, "{case}: {actual:?}, expected {expected:?}");
+    }
+    finish(bad);
+    assert_eq!(SOUND_ONLY_ID, "sound");
+}
+
+#[test]
+fn pornhub_addresses_are_told_apart_from_look_alikes() {
+    let cases = [
+        ("https://www.pornhub.com/view_video.php?viewkey=ph5f3a", true),
+        ("http://pornhub.com/view_video.php?viewkey=1", true),
+        ("https://pl.pornhub.com/view_video.php?viewkey=2", true),
+        ("https://de.pornhub.org/view_video.php?viewkey=3", true),
+        ("https://pornhub.org/v", true),
+        ("HTTPS://WWW.PORNHUB.COM/view_video.php?viewkey=4", true),
+        ("https://www.PornHub.Com/v", true),
+        ("https://www.pornhub.com:443/v", true),
+        ("https://viewer@www.pornhub.com/v", true),
+        ("  https://www.pornhub.com/v  ", true),
+        ("https://notpornhub.com/v", false),
+        ("https://pornhub.com.evil.example/v", false),
+        ("https://pornhub.community/v", false),
+        ("https://www.pornhub.net/v", false),
+        ("https://pornhub.com@evil.example/v", false),
+        ("https://evil.example/?u=https://www.pornhub.com/v", false),
+        ("ftp://www.pornhub.com/v", false),
+        ("pornhub.com/view_video.php?viewkey=5", false),
+        ("www.pornhub.com", false),
+        ("C:\\Videos\\pornhub.com\\clip.mp4", false),
+        ("/home/user/pornhub.com.mp4", false),
+        ("https://www.xnxx.com/video-abc/clip", false),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", false),
+        ("", false),
+        ("   ", false),
+    ];
+    let actual: Vec<(&str, bool)> = cases.iter().map(|&(url, _)| (url, is_pornhub_url(url))).collect();
+
+    assert_eq!(actual, cases);
+}
+
+fn h264_aac_info() -> MediaInfo {
+    common::demux_file("h264_aac.mp4").info
+}
+
+/// Without its picture: (pts, bytes, skip, limit) of each audio packet, and how many video packets came out.
+fn sound_packets(demux: &mut dyn Demuxer) -> (Vec<(f64, Vec<u8>, u32, Option<u32>)>, usize) {
+    let d = common::drain(demux).0;
+    let audio = d.audio.iter().zip(&d.audio_trim).map(|((pts, p), (skip, limit))| (*pts, p.data.to_vec(), *skip, *limit)).collect();
+    (audio, d.video.len())
+}
+
+/// `Ok` when both lists hold the same packets in the same order, else where they part (the
+/// packets themselves are too long to print whole).
+fn same_packets(actual: &[(f64, Vec<u8>, u32, Option<u32>)], expected: &[(f64, Vec<u8>, u32, Option<u32>)]) -> Result<(), String> {
+    match actual.iter().zip(expected).position(|(a, e)| a != e) {
+        Some(n) => Err(format!("packet {n} differs: pts {} vs {}, {} vs {} bytes", actual[n].0, expected[n].0, actual[n].1.len(), expected[n].1.len())),
+        None if actual.len() != expected.len() => Err(format!("{} packets, expected {}", actual.len(), expected.len())),
+        None => Ok(()),
+    }
+}
+
+#[test]
+fn sound_only_hides_the_picture_track_and_hands_out_every_audio_packet_and_no_video_packet() {
+    let path = common::fixture("h264_aac.mp4");
+    let reference = common::demux_file("h264_aac.mp4");
+    let mut sound = SoundOnly::new(playr::demux::open_path(&path).unwrap());
+
+    let info = format!("{:?}", sound.info());
+    let (audio, video_packets) = sound_packets(&mut sound);
+
+    let expected_audio: Vec<_> =
+        reference.audio.iter().zip(&reference.audio_trim).map(|((pts, p), (skip, limit))| (*pts, p.data.to_vec(), *skip, *limit)).collect();
+    assert!(!reference.video.is_empty() && !expected_audio.is_empty(), "the fixture must hold both: nothing would be dropped");
+    assert_eq!(info, format!("{:?}", MediaInfo { video: None, ..reference.info }));
+    assert_eq!((video_packets, same_packets(&audio, &expected_audio)), (0, Ok(())));
+}
+
+#[test]
+fn sound_only_seeks_where_the_inner_demuxer_seeks_and_plays_on_from_there() {
+    let path = common::fixture("h264_aac.mp4");
+    let mut inner = playr::demux::open_path(&path).unwrap();
+    let mut sound = SoundOnly::new(playr::demux::open_path(&path).unwrap());
+
+    let inner_landed = inner.seek(1.3);
+    let sound_landed = sound.seek(1.3);
+    let after_inner = sound_packets(inner.as_mut()).0;
+    let (after_sound, video_packets) = sound_packets(&mut sound);
+
+    assert_eq!(sound_landed, inner_landed);
+    assert!(after_inner.first().is_some_and(|p| p.0 > 1.0), "the seek moved nothing: {:?}", after_inner.first().map(|p| p.0));
+    assert_eq!((video_packets, same_packets(&after_sound, &after_inner)), (0, Ok(())));
+}
+
+/// Hands out its script of packets; logs where it was asked to seek.
+struct Scripted {
+    info: MediaInfo,
+    script: std::collections::VecDeque<Result<Option<Packet>, String>>,
+    seeks: Arc<Mutex<Vec<f64>>>,
+    seek_answer: Result<f64, String>,
+    unencrypted: bool,
+}
+
+impl Demuxer for Scripted {
+    fn info(&self) -> &MediaInfo {
+        &self.info
+    }
+
+    fn next_packet(&mut self) -> Result<Option<Packet>, String> {
+        self.script.pop_front().unwrap_or(Ok(None))
+    }
+
+    fn seek(&mut self, secs: f64) -> Result<f64, String> {
+        self.seeks.lock().unwrap().push(secs);
+        self.seek_answer.clone()
+    }
+
+    fn unencrypted(&self) -> bool {
+        self.unencrypted
+    }
+}
+
+fn scripted(script: Vec<Result<Option<Packet>, String>>, seek_answer: Result<f64, String>, unencrypted: bool) -> (SoundOnly, Arc<Mutex<Vec<f64>>>) {
+    let seeks = Arc::new(Mutex::new(Vec::new()));
+    let inner = Scripted { info: h264_aac_info(), script: script.into(), seeks: seeks.clone(), seek_answer, unencrypted };
+    (SoundOnly::new(Box::new(inner)), seeks)
+}
+
+fn picture(pts: f64) -> Result<Option<Packet>, String> {
+    Ok(Some(Packet::Video { pts, data: vec![0x65, 0x88].into_boxed_slice() }))
+}
+
+#[test]
+fn sound_only_passes_on_read_errors_the_end_seek_answers_and_the_unencrypted_flag() {
+    let (mut failing, _) = scripted(vec![picture(0.0), picture(0.04), Err("segment 3 could not be fetched".into())], Ok(0.0), false);
+    let (mut ending, _) = scripted(vec![picture(0.0), picture(0.04)], Ok(0.0), false);
+    let (mut seeking, seeks) = scripted(vec![], Ok(7.25), true);
+    let (mut refusing, _) = scripted(vec![], Err("cannot seek in a live stream".into()), false);
+
+    let read_error = failing.next_packet().map(|p| p.is_some());
+    let end = ending.next_packet().map(|p| p.is_some());
+    let landed = seeking.seek(7.5);
+    let refused = refusing.seek(2.5);
+
+    assert_eq!(read_error, Err("segment 3 could not be fetched".to_string()));
+    assert_eq!(end, Ok(false));
+    assert_eq!((landed, seeks.lock().unwrap().clone()), (Ok(7.25), vec![7.5]));
+    assert_eq!(refused, Err("cannot seek in a live stream".to_string()));
+    assert_eq!((seeking.unencrypted(), refusing.unencrypted()), (true, false));
 }
 
 fn fresh_dir(test: &str) -> PathBuf {
@@ -675,4 +874,161 @@ fn with_the_setting_off_a_page_or_a_video_fetched_over_plain_http_says_it_is_une
     assert_eq!(seen(&remote_page), expected, "page over plain http");
     assert_eq!(seen(&remote_video), expected, "video over plain http");
     assert_eq!(calls(), [page_call(&urls[0].replacen("http://", "https://", 1)), page_call(&urls[1])]);
+}
+
+/// Gives the fake yt-dlp its answers from inside the child, whose servers' ports the parent
+/// cannot know.
+fn answer_pages(pages: &Value) {
+    std::fs::write(test_dir().join("fake").join("fake.json"), json!({ "pages": pages }).to_string()).unwrap();
+}
+
+/// (video size, has sound)
+fn tracks(s: &Status) -> (Option<(u32, u32)>, bool) {
+    (s.video, s.has_audio)
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn with_audio_only_a_page_plays_the_sound_of_its_smallest_file_and_once_it_is_off_the_picture_again() {
+    let test = "with_audio_only_a_page_plays_the_sound_of_its_smallest_file_and_once_it_is_off_the_picture_again";
+    if !is_child() {
+        run_child(test, fake_env(&fresh_dir("page_audio_only"), &json!({})));
+        return;
+    }
+    let media = RangeServer::start(vec![
+        ("/big.mp4", Mode::Ranged, fixture_bytes("h264_aac.mp4")),
+        ("/small.mp4", Mode::Ranged, fixture_bytes("h264_longgop_aac.mp4")),
+    ]);
+    let pages = HtmlServer::start();
+    let page_url = pages.url("/watch/31");
+    answer_pages(&json!({ page_url.clone(): {
+        "extractor_key": "TestSite", "title": "A test video",
+        "formats": [
+            { "format_id": "small", "url": media.url("/small.mp4"), "protocol": "http", "ext": "mp4", "height": 120, "tbr": 300 },
+            { "format_id": "big", "url": media.url("/big.mp4"), "protocol": "http", "ext": "mp4", "height": 240, "tbr": 900 },
+            { "format_id": "huge", "url": media.url("/huge.mp4"), "protocol": "http", "ext": "mp4", "height": 2160, "tbr": 20000 },
+        ],
+    }}));
+    let fetched = |path: &str| media.requests().iter().filter(|r| r.path == path).count();
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+
+    player.set_audio_only(true);
+    let sound = reopen(&player, || player.open(page_url.clone()));
+    let chosen_but_sound = reopen(&player, || player.open_youtube_at(page_url.clone(), None, Choice { video: Some("big".into()), audio: None }));
+    let big_while_sound_only = fetched("/big.mp4");
+    let small_while_sound_only = fetched("/small.mp4");
+    player.set_audio_only(false);
+    let picture = reopen(&player, || player.open(page_url.clone()));
+    player.stop();
+
+    let sound_only = (State::Playing, "A test video".to_string(), "TestSite · sound only".to_string(), None, vec![]);
+    assert_eq!((seen(&sound), tracks(&sound)), (sound_only.clone(), (None, true)), "audio only");
+    assert_eq!((seen(&chosen_but_sound), tracks(&chosen_but_sound)), (sound_only, (None, true)), "audio only with a quality chosen");
+    assert_eq!((big_while_sound_only, small_while_sound_only > 0), (0, true), "the picture formats fetched while sound only");
+    let both = (State::Playing, "A test video".to_string(), "TestSite · H.264 320×240".to_string(), Some("big".to_string()), vec![]);
+    assert_eq!((seen(&picture), tracks(&picture)), (both, (Some((320, 240)), true)), "audio only off");
+    assert_eq!(fetched("/huge.mp4"), 0);
+}
+
+const MASTER_WITH_SOUND: &str = "#EXTM3U\n\
+    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Main\",DEFAULT=YES,URI=\"audio_only/index.m3u8\"\n\
+    #EXT-X-STREAM-INF:BANDWIDTH=600000,RESOLUTION=160x120,CODECS=\"avc1.64000c,mp4a.40.2\",AUDIO=\"aud\"\n\
+    video_only/index.m3u8\n\
+    #EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=80x60,CODECS=\"avc1.64000c,mp4a.40.2\",AUDIO=\"aud\"\n\
+    low/index.m3u8\n";
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn with_audio_only_an_hls_page_downloads_its_sound_and_no_picture() {
+    use common::hls_server::{HlsServer, PLAYLIST, bytes, fixture_dir};
+
+    let test = "with_audio_only_an_hls_page_downloads_its_sound_and_no_picture";
+    if !is_child() {
+        run_child(test, fake_env(&fresh_dir("page_audio_only_hls"), &json!({})));
+        return;
+    }
+    let mut routes = vec![bytes("/m/master.m3u8", PLAYLIST, MASTER_WITH_SOUND.as_bytes().to_vec())];
+    routes.extend(fixture_dir("video_only", "m/video_only"));
+    routes.extend(fixture_dir("audio_only", "m/audio_only"));
+    routes.extend(fixture_dir("video_only", "m/low"));
+    routes.extend(fixture_dir("video_only", "p/video_only"));
+    routes.extend(fixture_dir("audio_only", "p/audio_only"));
+    let server = HlsServer::start(routes);
+    let pages = HtmlServer::start();
+    let (split_page, master_page) = (pages.url("/watch/split"), pages.url("/watch/master"));
+    answer_pages(&json!({
+        split_page.clone(): { "extractor_key": "TestSite", "title": "Split", "formats": [
+            { "format_id": "hls-120", "url": server.url("/p/video_only/index.m3u8"), "protocol": "m3u8_native",
+              "vcodec": "avc1.64000c", "acodec": "none", "height": 120, "tbr": 600 },
+            { "format_id": "hls-audio", "url": server.url("/p/audio_only/index.m3u8"), "protocol": "m3u8",
+              "vcodec": "none", "acodec": "mp4a.40.2", "abr": 128 },
+        ]},
+        master_page.clone(): { "extractor_key": "TestSite", "title": "Master", "formats": [
+            { "format_id": "hls-master", "url": server.url("/m/master.m3u8"), "protocol": "m3u8_native",
+              "vcodec": "avc1.64000c", "acodec": "mp4a.40.2", "height": 120, "tbr": 800 },
+        ]},
+    }));
+    let under = |folder: &str| server.paths().into_iter().filter(|p| p.starts_with(&format!("/{folder}/"))).collect::<Vec<_>>();
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+    player.set_audio_only(true);
+
+    let split = reopen(&player, || player.open(split_page.clone()));
+    wait_for(&player, "the second sound segment", |_| under("p/audio_only").len() >= 3);
+    let master = reopen(&player, || player.open(master_page.clone()));
+    wait_for(&player, "the second sound segment", |_| under("m/audio_only").len() >= 3);
+    player.stop();
+
+    let sound_only = |title: &str| (State::Playing, title.to_string(), "TestSite · sound only".to_string(), None, vec![]);
+    assert_eq!((seen(&split), tracks(&split)), (sound_only("Split"), (None, true)), "picture and sound in separate playlists");
+    assert_eq!((seen(&master), tracks(&master)), (sound_only("Master"), (None, true)), "a master playlist with an audio rendition");
+    assert_eq!(under("p/video_only"), Vec::<String>::new(), "the split page's picture was downloaded");
+    assert_eq!(&under("p/audio_only")[..3], ["/p/audio_only/index.m3u8", "/p/audio_only/seg0.ts", "/p/audio_only/seg1.ts"]);
+    assert_eq!(under("m/video_only"), Vec::<String>::new(), "the master's best variant was read");
+    assert_eq!(under("m/low"), ["/m/low/index.m3u8"], "the cheapest variant's playlist only, no picture");
+    assert_eq!(&under("m/audio_only")[..3], ["/m/audio_only/index.m3u8", "/m/audio_only/seg0.ts", "/m/audio_only/seg1.ts"]);
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn a_pornhub_link_goes_to_yt_dlp_without_its_page_being_fetched() {
+    let test = "a_pornhub_link_goes_to_yt_dlp_without_its_page_being_fetched";
+    if !is_child() {
+        // Every request the child makes to anything but this computer goes to this stand-in
+        // proxy, which logs it: nothing reaches the real site, whatever the player does.
+        let proxy = HtmlServer::start();
+        let mut env = fake_env(&fresh_dir("pornhub"), &json!({}));
+        let address = proxy.url("");
+        for name in ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+            env.push((name, OsString::from(&address)));
+        }
+        env.push(("NO_PROXY", OsString::from("127.0.0.1,localhost")));
+        run_child(test, env);
+        let proxied = proxy.requests.lock().unwrap().clone();
+        assert_eq!(proxied, ["video.invalid:443"], "the requests that left this computer");
+        return;
+    }
+    let link = "https://www.pornhub.com/view_video.php?viewkey=ph5f3a";
+    let elsewhere = "https://video.invalid/watch/7";
+    let media = RangeServer::start(vec![("/ph.mp4", Mode::Ranged, fixture_bytes("h264_aac.mp4"))]);
+    answer_pages(&json!({ link: {
+        "extractor_key": "PornHub", "title": "A test clip",
+        "formats": [{ "format_id": "240p", "url": media.url("/ph.mp4"), "protocol": "http", "ext": "mp4", "height": 240 }],
+    }}));
+    let player = Player::new(Box::new(|| {}));
+    player.shared.audio.set_volume(0.0);
+
+    let played = reopen(&player, || player.open(link.to_string()));
+    player.set_audio_only(true);
+    let sound = reopen(&player, || player.open(link.to_string()));
+    player.set_audio_only(false);
+    let other = reopen(&player, || player.open(elsewhere.to_string()));
+    player.stop();
+
+    let expected = |info: &str, choice: Option<&str>| (State::Playing, "A test clip".to_string(), info.to_string(), choice.map(str::to_string), vec![]);
+    assert_eq!((seen(&played), tracks(&played)), (expected("PornHub · H.264 320×240", Some("240p")), (Some((320, 240)), true)));
+    assert_eq!((seen(&sound), tracks(&sound)), (expected("PornHub · sound only", None), (None, true)));
+    assert_eq!(other.state, State::Failed, "the stand-in proxy cannot have served a video: {other:?}");
+    assert_eq!(calls(), [page_call(link)], "yt-dlp was asked about the link once, and about nothing else");
 }

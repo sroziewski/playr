@@ -94,6 +94,73 @@ fn a_packet_exactly_at_the_position_is_not_counted_and_one_exactly_five_seconds_
     assert!(near(rate, Some(Rate { total: 1600.0, video: 1600.0, audio: 0.0 })), "{rate:?}");
 }
 
+/// Eight seconds read: a 3000-byte picture every 0.5 s from 0 to 8.0 (the newest record), a
+/// 400-byte sound packet every 0.5 s from 0.25 to 7.75. Every timestamp is exact in binary.
+fn read_to_eight_seconds() -> Meter {
+    let mut m = Meter::default();
+    for k in 0..=16 {
+        m.record(k as f64 * 0.5, 3000, true);
+        if k < 16 {
+            m.record(k as f64 * 0.5 + 0.25, 400, false);
+        }
+    }
+    m
+}
+
+#[test]
+fn once_the_position_has_run_past_everything_read_the_rate_is_that_of_the_last_five_seconds_read() {
+    // Past 8.0: the window is [3.0, 8.0] with the newest record in it. Pictures 3.0 .. 8.0 are
+    // 11 x 3000 = 33 000 bytes, sound 3.25 .. 7.75 is 10 x 400 = 4000 bytes, over 5 s:
+    // 52 800 and 6400 bits per second.
+    let starved = Some(Rate { total: 59_200.0, video: 52_800.0, audio: 6400.0 });
+    // At 8.0 itself nothing has run past: [3.0, 8.0) leaves out the picture at 8.0, so
+    // 10 x 3000 = 30 000 bytes of picture (48 000 b/s) and the same sound.
+    let at_newest = Some(Rate { total: 54_400.0, video: 48_000.0, audio: 6400.0 });
+    // At 6.0: [1.0, 6.0), pictures 1.0 .. 5.5 and sound 1.25 .. 5.75, 10 of each.
+    let behind = Some(Rate { total: 54_400.0, video: 48_000.0, audio: 6400.0 });
+    let cases = [
+        ("far past the newest record", 30.0, starved),
+        ("just past the newest record", 8.25, starved),
+        ("exactly at the newest record", 8.0, at_newest),
+        ("behind the newest record", 6.0, behind),
+    ];
+    let mut bad = Vec::new();
+    for (case, position, expected) in cases {
+        let actual = read_to_eight_seconds().rate(position);
+        expect!(bad, near(actual, expected), "{case} ({position}): {actual:?}, expected {expected:?}");
+    }
+    finish(bad);
+}
+
+#[test]
+fn past_everything_read_the_window_is_still_limited_by_the_earliest_record_and_needs_half_a_second() {
+    let meter = |records: &[(f64, usize, bool)]| {
+        let mut m = Meter::default();
+        for &(pts, bytes, video) in records {
+            m.record(pts, bytes, video);
+        }
+        m
+    };
+    let quarter = meter(&[(4.0, 1000, true), (4.25, 500, false)]);
+    // [4.0, 4.5]: 1000 + 2000 bytes of picture and 500 of sound over 0.5 s.
+    let half = meter(&[(4.0, 1000, true), (4.25, 500, false), (4.5, 2000, true)]);
+    // Recorded out of order: the newest is the record at 8.0, not the last one recorded (6.0).
+    // [4.0, 8.0]: 3000 + 2000 bytes of picture and 1000 of sound over 4 s.
+    let out_of_order = meter(&[(8.0, 2000, true), (4.0, 3000, true), (6.0, 1000, false)]);
+    let cases = [
+        ("0.25 s read", &quarter, 9.0, None),
+        ("a single record", &meter(&[(4.0, 1000, true)]), 9.0, None),
+        ("exactly 0.5 s read", &half, 9.0, Some(Rate { total: 56_000.0, video: 48_000.0, audio: 8000.0 })),
+        ("records out of order", &out_of_order, 10.0, Some(Rate { total: 12_000.0, video: 10_000.0, audio: 2000.0 })),
+    ];
+    let mut bad = Vec::new();
+    for (case, m, position, expected) in cases {
+        let actual = m.rate(position);
+        expect!(bad, near(actual, expected), "{case} ({position}): {actual:?}, expected {expected:?}");
+    }
+    finish(bad);
+}
+
 #[test]
 fn timestamps_that_are_not_numbers_are_not_recorded() {
     let mut m = Meter::default();

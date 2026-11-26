@@ -24,7 +24,7 @@ pub fn set_https_only(on: bool) {
     HTTPS_ONLY.store(on, Ordering::Relaxed);
 }
 
-fn host_of(url: &str) -> Option<&str> {
+pub(crate) fn host_of(url: &str) -> Option<&str> {
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next()?;
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);

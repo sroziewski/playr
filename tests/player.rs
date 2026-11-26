@@ -354,22 +354,6 @@ fn play_at_the_end_restarts_mp4_and_matroska_files_from_the_beginning() {
 }
 
 #[test]
-fn the_end_is_reported_only_after_the_last_picture_has_been_taken() {
-    let s = start();
-    assert_eq!(s.open(&path_of("h264_aac.mp4")).state, State::Playing);
-
-    // Nobody takes pictures: one second past the end of the 2 s file it is still "playing".
-    wait_for(&s.player, "the clock to pass the end", Duration::from_secs(15), || (s.player.shared.position() >= 2.0).then_some(()));
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(s.player.shared.status().state, State::Playing);
-
-    wait_for(&s.player, "the end once pictures are taken", Duration::from_secs(15), || {
-        s.player.shared.take_due_frame();
-        (s.player.shared.status().state == State::Ended).then_some(())
-    });
-}
-
-#[test]
 fn pause_holds_the_position_and_resume_continues_from_it() {
     let s = start();
     assert_eq!(s.open(&path_of("h264_longgop_aac.mp4")).state, State::Playing);
@@ -1036,10 +1020,13 @@ fn of_several_files_opened_in_a_row_the_last_one_plays() {
 
     assert_eq!(status.state, State::Playing, "{status:?}");
     assert_eq!((status.title.as_str(), status.info.as_str()), ("h264_aac.mp4", "isomp4 · H.264 320×240"));
-    std::thread::sleep(Duration::from_millis(600));
-    let later = s.player.shared.status();
+    // When the first sound comes out depends on the device (over a second on some), so the
+    // clock is given time to get going; meanwhile no earlier open may take over.
+    let later = wait_for(&s.player, "the last file to play past 0.3 s", Duration::from_secs(10), || {
+        let status = s.player.shared.status();
+        (status.source != last || s.player.shared.position() > 0.3).then_some(status)
+    });
     assert_eq!((later.source, later.state), (last, State::Playing), "an earlier open was carried out after the last one");
-    assert!(s.player.shared.position() > 0.3, "the last file is playing");
 }
 
 #[test]
@@ -1323,4 +1310,199 @@ fn local_playlist_file_opens_the_stream_it_names() {
     assert_eq!(status.state, State::Playing, "{status:?}");
     assert_eq!((status.title.as_str(), status.live), (STATION, true));
     assert_eq!(server.requests_for("/stream").len(), 1);
+}
+
+#[test]
+fn playback_carries_on_while_nothing_takes_the_pictures_and_then_shows_the_current_one() {
+    // A covered, minimized or dragged window draws nothing, so nobody calls take_due_frame.
+    // h264_16s_aac.mp4 has 400 video packets, more than the reader may stash (300) while
+    // the picture queue stays full: the stash fills at about 13 s. The file's own sound ends at
+    // 16 s, and the reader reaches it (the clock then runs free) about 0.6 s before that.
+    let s = start();
+    let reference = read_framecrc("h264_16s_aac.mp4");
+    let status = s.open(&path_of("h264_16s_aac.mp4"));
+    assert_eq!(status.state, State::Playing, "{status:?}");
+    assert!(status.has_audio, "{status:?}");
+
+    struct Sample {
+        at: f64,
+        position: f64,
+        buffered: usize,
+        free_run: bool,
+        state: State,
+    }
+    let mut samples: Vec<Sample> = Vec::new();
+    let started = Instant::now();
+    wait_for(&s.player, "the clock to reach 14.5 s without the pictures being taken", Duration::from_secs(30), || {
+        let audio = &s.player.shared.audio;
+        let sample = Sample {
+            at: started.elapsed().as_secs_f64(),
+            position: s.player.shared.position(),
+            buffered: audio.buffered_frames(),
+            free_run: audio.is_free_run(),
+            state: s.player.shared.status().state,
+        };
+        let done = sample.position >= 14.5;
+        samples.push(sample);
+        std::thread::sleep(Duration::from_millis(20));
+        done.then_some(())
+    });
+
+    let not_playing: Vec<String> =
+        samples.iter().filter(|x| x.state != State::Playing).map(|x| format!("{:?} at {:.2} s", x.state, x.position)).collect();
+    assert_eq!(not_playing, Vec::<String>::new(), "playback left the Playing state");
+    // Past the first half second the sound must be fed all along, never left to run dry and
+    // never replaced by a silent clock.
+    let starved: Vec<String> = samples
+        .iter()
+        .filter(|x| x.position >= 0.5 && (x.buffered == 0 || x.free_run))
+        .map(|x| format!("at {:.2} s: {} frames buffered, free run {}", x.position, x.buffered, x.free_run))
+        .collect();
+    assert_eq!(starved, Vec::<String>::new(), "the sound ran dry while the pictures were not taken");
+    for (from, to) in [(1.0, 7.0), (7.0, 14.4)] {
+        let a = samples.iter().find(|x| x.position >= from).expect("clock sample");
+        let b = samples.iter().rev().find(|x| x.position <= to).expect("clock sample");
+        let rate = (b.position - a.position) / (b.at - a.at);
+        assert!((0.9..=1.1).contains(&rate), "the clock ran at {rate:.3}x real time between {from} s and {to} s");
+    }
+
+    // The UI draws again: the first picture it gets is the one due now, not one left over
+    // from when it stopped drawing. Due means pts <= position + 2 ms; the newest due picture
+    // is at most one frame interval (40 ms) old, plus the pipeline's 4 ms idle wait.
+    let (first, _) = s.player.shared.take_due_frame();
+    let position = s.player.shared.position();
+    let first = first.expect("a picture is due");
+    let age = position - first.pts;
+    assert!((-0.002..=0.050).contains(&age), "the picture shown at {position:.3} s is from {:.3} s", first.pts);
+    assert_eq!(picture_fault(&first, &reference), None);
+
+    // And the pictures go on from there, one by one.
+    let mut frames = vec![first];
+    wait_for(&s.player, "the clock to reach 15.3 s", Duration::from_secs(5), || {
+        frames.extend(s.player.shared.take_due_frame().0);
+        (s.player.shared.position() >= 15.3).then_some(())
+    });
+    assert_ascending(&frames, "after drawing resumed");
+    assert!(frames.len() >= 16, "{} of about 20 pictures shown in the 0.8 s after drawing resumed", frames.len());
+    let faults: Vec<String> = frames.iter().filter_map(|f| picture_fault(f, &reference)).collect();
+    assert_eq!(faults, Vec::<String>::new(), "pictures and timestamps do not belong together");
+    assert_eq!(s.player.shared.status().state, State::Playing);
+}
+
+#[test]
+fn a_file_ends_while_nothing_takes_the_pictures_and_its_last_picture_is_still_shown() {
+    // Both files: 2 s, 50 pictures at 25 fps, the last at 1.96 s. In h264_aac.mp4 the sound
+    // (2.02 s) outlasts the pictures; in h264_2s_audio_1s.mp4 it stops at 1 s and the last
+    // picture decides the end.
+    let mut bad = Vec::new();
+    for file in ["h264_aac.mp4", "h264_2s_audio_1s.mp4"] {
+        let s = start();
+        let reference = read_framecrc(file);
+        let started = Instant::now();
+        let status = s.open(&path_of(file));
+        assert_eq!(status.state, State::Playing, "{file}: {status:?}");
+
+        let (ended, position_at_end) = wait_for(&s.player, &format!("the end of {file} without the pictures being taken"), Duration::from_secs(15), || {
+            let status = s.player.shared.status();
+            let position = s.player.shared.position();
+            (status.state != State::Playing).then_some((status, position))
+        });
+        let took = started.elapsed().as_secs_f64();
+
+        if (ended.state, &ended.error) != (State::Ended, &None) {
+            bad.push(format!("{file}: came to rest as {:?} with error {:?}", ended.state, ended.error));
+        }
+        // The position only moves forward (after the end the sound already sent still plays
+        // out), so read after the Ended state it bounds where the end was decided: only once
+        // the last picture was due (1.96 <= position + 2 ms).
+        if position_at_end < 1.958 {
+            bad.push(format!("{file}: Ended reported at {position_at_end:.3} s, before the last picture at 1.96 s was due"));
+        }
+        if !(1.9..=6.0).contains(&took) {
+            bad.push(format!("{file}: the 2 s file took {took:.2} s to end"));
+        }
+        let (last, next) = s.player.shared.take_due_frame();
+        match last {
+            Some(last) if (last.pts - 1.96).abs() <= 0.001 => bad.extend(picture_fault(&last, &reference).map(|f| format!("{file}: {f}"))),
+            Some(last) => bad.push(format!("{file}: the picture drawn after the end is from {:.3} s, not the last one at 1.96 s", last.pts)),
+            None => bad.push(format!("{file}: no picture left to draw after the end")),
+        }
+        if next.is_some() {
+            bad.push(format!("{file}: a picture is still queued after the last one ({next:?} s away)"));
+        }
+    }
+    finish(bad);
+}
+
+/// A list of `files` (absolute paths, so no relative lookups) written to a fresh .m3u.
+fn m3u_of(name: &str, files: &[&str]) -> String {
+    let text: String = std::iter::once("#EXTM3U\n".to_string()).chain(files.iter().map(|f| format!("{}\n", path_of(f)))).collect();
+    tmp_file(name, text.as_bytes()).to_str().expect("utf-8 path").to_string()
+}
+
+#[test]
+fn in_a_list_a_drawing_window_shows_the_last_picture_of_an_entry_before_the_next_one_starts() {
+    // Entry 1 ends on its last picture (its sound stops at 1 s), the moment the next entry
+    // would clear the picture queue. The UI here draws at 60 Hz.
+    let s = start();
+    let list = m3u_of("player_two_entries.m3u", &["h264_2s_audio_1s.mp4", "h264_aac.mp4"]);
+    let (first_ref, second_ref) = (read_framecrc("h264_2s_audio_1s.mp4"), read_framecrc("h264_aac.mp4"));
+    assert_eq!(s.open(&list).state, State::Playing);
+
+    let mut frames: Vec<VideoFrame> = Vec::new();
+    let (mut last_taken, mut next_opened): (Option<Instant>, Option<Instant>) = (None, None);
+    wait_for(&s.player, "entry 2 to show a picture past 0.5 s", Duration::from_secs(20), || {
+        if let (Some(frame), _) = s.player.shared.take_due_frame() {
+            if frame.width == 160 && (frame.pts - 1.96).abs() <= 0.001 {
+                last_taken = Some(Instant::now());
+            }
+            frames.push(frame);
+        }
+        let status = s.player.shared.status();
+        if status.entry == 1 && next_opened.is_none() {
+            next_opened = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+        (status.entry == 1 && frames.last().is_some_and(|f| f.pts >= 0.5 && f.width == 320)).then_some(())
+    });
+
+    // Once the last picture is taken the next entry opens at the pipeline's next look, at most
+    // its 20 ms idle wait later; the entry number is set as soon as the list entry is picked,
+    // and this loop sees it on the same pass or after one more 16 ms frame. About 40 ms in all;
+    // 150 ms leaves room for a busy machine and is still far below the 250 ms the entry would
+    // wait if the taken picture were not noticed.
+    let (last_taken, next_opened) = (last_taken.expect("the 1.96 s picture of entry 1 was taken"), next_opened.expect("entry 2 opened"));
+    let gap = next_opened.saturating_duration_since(last_taken).as_millis();
+    assert!(next_opened >= last_taken, "entry 2 opened before the last picture of entry 1 was taken");
+    assert!(gap <= 150, "entry 2 opened {gap} ms after the last picture of entry 1 was taken");
+
+    // Entry 1 is 160x120, entry 2 320x240.
+    let switch = frames.iter().position(|f| f.width == 320).expect("a picture of entry 2");
+    let (last_of_first, first_of_second) = (&frames[switch - 1], &frames[switch]);
+    assert!((last_of_first.pts - 1.96).abs() <= 0.001, "the last picture of entry 1 drawn was from {:.3} s, not 1.96 s", last_of_first.pts);
+    assert_eq!(picture_fault(last_of_first, &first_ref), None);
+    assert_eq!(picture_fault(first_of_second, &second_ref), None);
+    assert!(frames[switch..].iter().all(|f| f.width == 320), "a picture of entry 1 came after entry 2 started");
+}
+
+#[test]
+fn in_a_list_the_next_entry_opens_even_when_nothing_draws() {
+    let s = start();
+    let list = m3u_of("player_two_entries_undrawn.m3u", &["h264_2s_audio_1s.mp4", "h264_aac.mp4"]);
+    assert_eq!(s.open(&list).state, State::Playing);
+
+    // No take_due_frame at all. Entry 1's last picture is due at 1.958 s on its clock.
+    let mut end_of_first: Option<Instant> = None;
+    let status = wait_for(&s.player, "entry 2 to play", Duration::from_secs(20), || {
+        let status = s.player.shared.status();
+        if status.entry == 0 && end_of_first.is_none() && s.player.shared.position() >= 1.958 {
+            end_of_first = Some(Instant::now());
+        }
+        (status.entry == 1 && status.state == State::Playing).then_some(status)
+    });
+    let waited = end_of_first.expect("entry 1 reached its last picture").elapsed().as_secs_f64();
+
+    // Entry 2 (h264_aac.mp4) is the 320x240 one.
+    assert_eq!((status.video, status.error), (Some((320, 240)), None));
+    assert!(waited <= 1.0, "entry 2 opened {waited:.2} s after entry 1 reached its end");
 }

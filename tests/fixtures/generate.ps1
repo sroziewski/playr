@@ -39,6 +39,11 @@ Run ((Video 3 '1920x1080') + (Sine 3) + $x264 + $aac + $bitexact + "$here\h264_1
 Run ((Video 16 '160x120') + (Sine 2) + $x264 + @('-bf', '0', '-g', '25') + $aac + $bitexact + "$here\h264_16s_audio_2s.mp4")
 # The same picture with the sound arriving only at 14 s, 350 video packets into the file.
 Run ((Video 16 '160x120') + @('-itsoffset', '14') + (Sine 2) + $x264 + @('-bf', '0', '-g', '25') + $aac + $bitexact + "$here\h264_16s_audio_from_14s.mp4")
+# The same picture with sound all the way: 400 video packets, more than the reader may stash
+# (300) while nobody takes the decoded pictures off the queue.
+Run ((Video 16 '160x120') + (Sine 16) + $x264 + @('-bf', '0', '-g', '25') + $aac + $bitexact + "$here\h264_16s_aac.mp4")
+# 2 s of picture with 1 s of sound: the end of the file is decided by its last picture.
+Run ((Video 2 '160x120') + (Sine 1) + $x264 + @('-bf', '0', '-g', '25') + $aac + $bitexact + "$here\h264_2s_audio_1s.mp4")
 # Short groups of pictures: every picture an IDR, and an IDR every fourth picture.
 Run ((Video 4) + (Sine 4) + $x264 + @('-g', '1') + $aac + $bitexact + "$here\h264_intra_aac.mp4")
 Run ((Video 4) + (Sine 4) + $x264 + @('-g', '4', '-keyint_min', '4', '-sc_threshold', '0') + $aac + $bitexact + "$here\h264_gop4_aac.mp4")
@@ -123,7 +128,7 @@ foreach ($f in 'h264_aac.mp4', 'h264_bframes_aac.mp4', 'h264_vorbis.mkv', 'hevc_
     Run @('-i', "$here\$f", '-map', '0:v:0', '-vf', 'select=eq(n\,0)', '-frames:v', '1', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', "$here\$f.f0.yuv")
     Run @('-i', "$here\$f", '-map', '0:v:0', '-vf', 'select=eq(n\,37)', '-frames:v', '1', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', "$here\$f.f37.yuv")
 }
-foreach ($f in 'h264_longgop_aac.mp4', 'h264_1080p_aac.mp4', 'h264_16s_audio_2s.mp4', 'h264_opengop_aac.mp4', 'h264_faststart_aac.mp4', 'h264_16s_audio_from_14s.mp4', 'h264_intra_aac.mp4', 'h264_gop4_aac.mp4', 'hevc_intra_aac.mp4') {
+foreach ($f in 'h264_longgop_aac.mp4', 'h264_1080p_aac.mp4', 'h264_16s_audio_2s.mp4', 'h264_opengop_aac.mp4', 'h264_faststart_aac.mp4', 'h264_16s_audio_from_14s.mp4', 'h264_16s_aac.mp4', 'h264_2s_audio_1s.mp4', 'h264_intra_aac.mp4', 'h264_gop4_aac.mp4', 'hevc_intra_aac.mp4') {
     Run @('-i', "$here\$f", '-map', '0:v:0', '-pix_fmt', 'yuv420p', '-fps_mode', 'passthrough', '-f', 'framecrc', "$here\$f.framecrc")
 }
 

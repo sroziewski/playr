@@ -59,6 +59,43 @@ pub fn open_stream(
     Ok(Box::new(SymDemuxer::open(source, ext, mime)?))
 }
 
+/// The sound of a demuxer whose picture is not wanted: the video track is hidden and its
+/// packets are dropped as they are read (they still have to be read past).
+pub struct SoundOnly {
+    inner: Box<dyn Demuxer>,
+    info: MediaInfo,
+}
+
+impl SoundOnly {
+    pub fn new(inner: Box<dyn Demuxer>) -> Self {
+        let info = MediaInfo { video: None, ..inner.info().clone() };
+        Self { inner, info }
+    }
+}
+
+impl Demuxer for SoundOnly {
+    fn info(&self) -> &MediaInfo {
+        &self.info
+    }
+
+    fn next_packet(&mut self) -> Result<Option<Packet>, String> {
+        loop {
+            match self.inner.next_packet()? {
+                Some(Packet::Video { .. }) => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    fn seek(&mut self, secs: f64) -> Result<f64, String> {
+        self.inner.seek(secs)
+    }
+
+    fn unencrypted(&self) -> bool {
+        self.inner.unencrypted()
+    }
+}
+
 fn video_codec(id: VideoCodecId) -> VideoCodec {
     let name = match id {
         CODEC_ID_H264 => return VideoCodec::H264,

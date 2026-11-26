@@ -619,8 +619,20 @@ impl App {
         });
     }
 
+    /// The "Audio only" tick of web videos; true when it is on.
+    fn audio_only_tick(&mut self, ui: &mut egui::Ui, status: &Status, site: &str) -> bool {
+        let mut audio_only = self.player.shared.audio_only();
+        let tip = format!("Play {site} as sound only, like radio: the picture is not shown or decoded");
+        if ui.checkbox(&mut audio_only, "🎧 Audio only").on_hover_text(tip).changed() {
+            self.player.set_audio_only(audio_only);
+            let what = if audio_only { "sound only" } else { "video and sound" };
+            self.reopen_youtube(status, status.choice.clone(), what);
+        }
+        audio_only
+    }
+
     fn page_menu(&mut self, ui: &mut egui::Ui, status: &Status, page: &crate::sites::Page) {
-        if page.formats.len() < 2 {
+        if self.audio_only_tick(ui, status, &page.site) || page.formats.len() < 2 {
             return;
         }
         let current = page.pick(status.choice.video.as_deref());
@@ -641,15 +653,7 @@ impl App {
 
     fn youtube_menus(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, status: &Status, video: &Video) {
         let (current_video, current_audio) = video.pick(&status.choice);
-        let mut audio_only = self.player.shared.youtube_audio_only();
-        let tick = ui
-            .checkbox(&mut audio_only, "🎧 Audio only")
-            .on_hover_text("Play YouTube as sound only, like radio: no picture is downloaded or decoded");
-        if tick.changed() {
-            self.player.set_youtube_audio_only(audio_only);
-            let what = if audio_only { "sound only" } else { "video and sound" };
-            self.reopen_youtube(status, status.choice.clone(), what);
-        }
+        let audio_only = self.audio_only_tick(ui, status, "YouTube");
         if !video.video.is_empty() && !audio_only {
             let label = current_video.map_or_else(|| "Quality".to_string(), |f| format!("⚙ {}", f.label()));
             ui.menu_button(label, |ui| {
@@ -738,8 +742,9 @@ impl App {
             return;
         };
         let rate = display.rate;
+        let ahead = shared.read_ahead().map_or_else(|| "—".to_string(), |s| format!("{s:+.1} s"));
         let tip = format!(
-            "Bitrate over the last {:.0} s of playback\npicture {}\nsound {}",
+            "Bitrate over the last {:.0} s of the media\npicture {}\nsound {}\nread ahead of playback {ahead}",
             bitrate::WINDOW,
             bitrate::format(rate.video),
             bitrate::format(rate.audio)

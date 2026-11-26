@@ -455,7 +455,7 @@ fn a_youtube_playlist_link_starts_at_its_v_video_and_steps_through_the_list_keep
     let skipped = wait_for(&player, "the entry after the refused one", |s| s.state == State::Playing && s.entry == 3);
     let both = Choice { video: Some("134".into()), audio: Some("140".into()) };
     let requality = reopen(&player, || player.open_youtube_at(url.clone(), Some(3), both.clone()));
-    player.set_youtube_audio_only(true);
+    player.set_audio_only(true);
     let sound_only = reopen(&player, || player.open_entry(url.clone(), 0));
     player.stop();
 

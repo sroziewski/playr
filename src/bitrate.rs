@@ -42,6 +42,11 @@ impl Meter {
         }
     }
 
+    /// The latest presentation time recorded.
+    pub fn newest(&self) -> Option<f64> {
+        (!self.records.is_empty()).then_some(self.newest)
+    }
+
     pub fn clear(&mut self) {
         self.records.clear();
         self.newest = 0.0;
@@ -57,19 +62,25 @@ impl Meter {
 
     /// The rate over the [`WINDOW`] of media ending at `position`, or over the part of it the
     /// records cover (from the earliest one) when that is shorter. `None` under [`MIN_SPAN`].
+    ///
+    /// When the clock has run past everything read (after the last packet of the media, while
+    /// the clock carries on without sound for the pictures that remain), the window ends at
+    /// the newest record instead, where an empty window would read 0.
     pub fn rate(&self, position: f64) -> Option<Rate> {
         if !position.is_finite() {
             return None;
         }
-        let from = position - WINDOW;
+        let starved = !self.records.is_empty() && position > self.newest;
+        let end = if starved { self.newest } else { position };
+        let from = end - WINDOW;
         let earliest = self.records.iter().map(|r| r.0).fold(f64::INFINITY, f64::min);
-        let span = position - from.max(earliest);
+        let span = end - from.max(earliest);
         if !(span >= MIN_SPAN) {
             return None;
         }
         let (mut video, mut audio) = (0u64, 0u64);
         for &(pts, bytes, is_video) in &self.records {
-            if pts >= from && pts < position {
+            if pts >= from && (pts < end || starved && pts <= end) {
                 if is_video { video += bytes as u64 } else { audio += bytes as u64 }
             }
         }

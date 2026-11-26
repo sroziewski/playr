@@ -70,6 +70,47 @@ impl Page {
     pub fn pick(&self, id: Option<&str>) -> Option<&Format> {
         id.and_then(|id| self.formats.iter().find(|f| f.id == id)).or_else(|| self.default_format())
     }
+
+    /// What to fetch for the sound alone: the page's HLS sound stream when it has one (no
+    /// picture is downloaded), otherwise the smallest format (its picture is downloaded but
+    /// not decoded). Of formats of equal height the lower bitrate wins; an unknown height
+    /// counts as the tallest, an unknown bitrate as the highest.
+    pub fn sound_format(&self) -> Option<Format> {
+        if let Some(sound) = self.formats.iter().find_map(|f| f.audio.clone()) {
+            return Some(Format {
+                id: SOUND_ONLY_ID.into(),
+                url: sound,
+                ext: None,
+                width: None,
+                height: None,
+                tbr: None,
+                hls: true,
+                audio: None,
+            });
+        }
+        let size = |f: &Format| (f.height.unwrap_or(u32::MAX), f.tbr.unwrap_or(f64::INFINITY));
+        self.formats
+            .iter()
+            .min_by(|a, b| {
+                let ((ha, ta), (hb, tb)) = (size(a), size(b));
+                ha.cmp(&hb).then(ta.total_cmp(&tb))
+            })
+            .cloned()
+    }
+}
+
+/// The format id [`Page::sound_format`] gives the page's own HLS sound stream.
+pub const SOUND_ONLY_ID: &str = "sound";
+
+/// Pornhub video addresses, which go to yt-dlp without the page being fetched first (the
+/// site answers a plain page request with a challenge or an age gate).
+pub fn is_pornhub_url(url: &str) -> bool {
+    if !crate::net::is_url(url) {
+        return false;
+    }
+    let Some(host) = crate::privacy::host_of(url.trim()) else { return false };
+    let host = host.to_ascii_lowercase();
+    ["pornhub.com", "pornhub.org"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 fn text(v: &Value, key: &str) -> Option<String> {
@@ -201,6 +242,18 @@ pub fn open(page: &Page, format: &Format, abort: Arc<AtomicBool>) -> Result<(Box
     let secure = fetch.is_encrypted();
     let source = RangeSource::new(Arc::new(fetch), abort);
     Ok((demux::open_stream(Box::new(source), format.ext.as_deref(), None)?, secure))
+}
+
+/// Opens the sound of `format` (from [`Page::sound_format`]) without its picture: HLS is
+/// fetched without the picture where the playlist allows; a single file's picture bytes still
+/// come in with the sound as it plays, but are not decoded.
+pub fn open_sound(page: &Page, format: &Format, abort: Arc<AtomicBool>) -> Result<(Box<dyn Demuxer>, bool), String> {
+    if format.hls {
+        let opened = hls::open(&Location::Url(format.url.clone()), None, &page.headers, true, abort)?;
+        return Ok((Box::new(demux::SoundOnly::new(opened.demuxer)), opened.secure));
+    }
+    let (demuxer, secure) = open(page, format, abort)?;
+    Ok((Box::new(demux::SoundOnly::new(demuxer)), secure))
 }
 
 pub fn is_html(mime: Option<&str>) -> bool {
