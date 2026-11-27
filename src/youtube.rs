@@ -692,6 +692,12 @@ pub fn search(queries: &[String], expected: Option<f64>, abort: &AtomicBool, pro
     fallback.ok_or_else(|| format!("nothing found on YouTube for \u{201c}{first}\u{201d}"))
 }
 
+/// Runs playr's yt-dlp (downloading it first if needed) with `args`.
+pub fn run_ytdlp(args: &[&str], abort: &AtomicBool, progress: &dyn Fn(&str)) -> Result<String, String> {
+    let exe = ytdlp_candidates(progress).into_iter().next().map(|(exe, _)| exe).ok_or("browsing YouTube needs yt-dlp, which could not be downloaded")?;
+    run_quiet(&exe, args, YTDLP_TIMEOUT, abort)
+}
+
 /// The yt-dlp executables to try, best first, each flagged when it is playr's own copy (which
 /// may be updated). Downloads playr's copy if there is none yet.
 fn ytdlp_candidates(progress: &dyn Fn(&str)) -> Vec<(PathBuf, bool)> {

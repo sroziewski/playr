@@ -315,7 +315,7 @@ fn speed_after_clamps_speeds_outside_the_range_into_it() {
     assert_eq!(speed_after(0.1, -1), 0.25);
 }
 
-const BOUND_KEYS: [(Key, Shortcut); 16] = [
+const BOUND_KEYS: [(Key, Shortcut); 17] = [
     (Key::Space, Shortcut::PlayPause),
     (Key::ArrowLeft, Shortcut::SkipBack),
     (Key::ArrowRight, Shortcut::SkipForward),
@@ -326,6 +326,7 @@ const BOUND_KEYS: [(Key, Shortcut); 16] = [
     (Key::M, Shortcut::Mute),
     (Key::O, Shortcut::OpenFile),
     (Key::U, Shortcut::OpenUrl),
+    (Key::Y, Shortcut::OpenYouTube),
     (Key::F, Shortcut::ToggleFullscreen),
     (Key::F12, Shortcut::ToggleFullscreen),
     (Key::Escape, Shortcut::LeaveFullscreen),
@@ -351,7 +352,7 @@ fn every_other_key_gives_no_shortcut() {
     let unbound: Vec<Key> = Key::ALL.iter().copied().filter(|k| !BOUND_KEYS.iter().any(|(b, _)| b == k)).collect();
     let bound_hits: Vec<(Key, Shortcut)> = unbound.iter().filter_map(|&k| shortcut(k, false).map(|s| (k, s))).collect();
 
-    assert_eq!(unbound.len(), Key::ALL.len() - 16, "16 distinct keys are bound");
+    assert_eq!(unbound.len(), Key::ALL.len() - 17, "17 distinct keys are bound");
     for key in [Key::A, Key::Enter, Key::F11, Key::Tab, Key::Num5] {
         assert!(unbound.contains(&key), "{key:?} must be among the unbound keys tested");
     }
@@ -362,7 +363,7 @@ fn every_other_key_gives_no_shortcut() {
 fn no_key_is_a_shortcut_while_a_text_field_has_focus() {
     let hits: Vec<(Key, Shortcut)> = Key::ALL.iter().filter_map(|&k| shortcut(k, true).map(|s| (k, s))).collect();
 
-    assert!(Key::ALL.contains(&Key::F) && Key::ALL.contains(&Key::F12) && Key::ALL.contains(&Key::Space));
+    assert!(Key::ALL.contains(&Key::F) && Key::ALL.contains(&Key::F12) && Key::ALL.contains(&Key::Space) && Key::ALL.contains(&Key::Y));
     assert_eq!(hits, Vec::<(Key, Shortcut)>::new());
 }
 

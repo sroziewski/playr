@@ -65,8 +65,8 @@ pub fn agent_with(https_only: bool) -> ureq::Agent {
         .into()
 }
 
-/// Reads a whole (small) text resource, at most `limit` bytes of it.
-pub fn get_text(url: &str, headers: &[(String, String)], limit: u64) -> Result<String, String> {
+/// Reads a whole (small) resource, at most `limit` bytes of it.
+pub fn get_bytes(url: &str, headers: &[(String, String)], limit: u64) -> Result<Vec<u8>, String> {
     let resp = crate::privacy::fetch(url, |a| {
         let mut req = agent_with(a.https_only).get(&a.url);
         for (name, value) in headers {
@@ -80,7 +80,12 @@ pub fn get_text(url: &str, headers: &[(String, String)], limit: u64) -> Result<S
         .take(limit)
         .read_to_end(&mut raw)
         .map_err(|e| format!("cannot download {}: {e}", short(url)))?;
-    Ok(String::from_utf8_lossy(&raw).into_owned())
+    Ok(raw)
+}
+
+/// Reads a whole (small) text resource, at most `limit` bytes of it.
+pub fn get_text(url: &str, headers: &[(String, String)], limit: u64) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&get_bytes(url, headers, limit)?).into_owned())
 }
 
 /// A URL cut down for an error message (stream addresses run to a kilobyte of query string).

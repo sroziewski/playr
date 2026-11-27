@@ -9,6 +9,7 @@
 pub mod audio_out;
 pub mod avi;
 pub mod bitrate;
+pub mod browse;
 pub mod controls;
 pub mod cookies;
 pub mod corner;
@@ -30,6 +31,7 @@ pub mod stretch;
 pub mod subtitles;
 pub mod ts;
 pub mod ui;
+pub mod ui_browse;
 pub mod vdec;
 pub mod video_gl;
 pub mod youtube;

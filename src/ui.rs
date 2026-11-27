@@ -10,6 +10,7 @@ use eframe::egui::{self, Align2, Color32, Key, RichText, ViewportCommand};
 use eframe::egui_glow;
 
 use crate::bitrate;
+use crate::browse;
 use crate::cookies;
 use crate::corner::{self, Corner};
 use crate::history;
@@ -22,6 +23,7 @@ use crate::net;
 use crate::player::{Player, State, Status};
 use crate::radio::{self, Station};
 use crate::subtitles::Subtitles;
+use crate::ui_browse::Browser;
 use crate::video_gl::VideoRenderer;
 use crate::youtube::{self, Caption, CaptionKind, Choice, Video};
 
@@ -59,6 +61,7 @@ pub struct App {
     history_exists: Arc<Mutex<(Option<Instant>, HashMap<String, bool>)>>,
     history_checking: Arc<AtomicBool>,
     bitrate_shown: Option<bitrate::Display>,
+    browser: Browser,
 }
 
 #[derive(Default)]
@@ -79,10 +82,7 @@ impl App {
         if let Some(path) = privacy::settings_path() {
             privacy::set_https_only(privacy::load(&path));
         }
-        if let Some(target) = initial {
-            player.open(target);
-        }
-        Self {
+        let mut app = Self {
             player,
             renderer: Arc::new(Mutex::new(VideoRenderer::default())),
             frame_size: None,
@@ -108,7 +108,12 @@ impl App {
             history_exists: Arc::new(Mutex::new((None, HashMap::new()))),
             history_checking: Arc::new(AtomicBool::new(false)),
             bitrate_shown: None,
+            browser: Browser::default(),
+        };
+        if let Some(target) = initial {
+            app.open_target(&cc.egui_ctx, target);
         }
+        app
     }
 
     fn open_dialog(&mut self) {
@@ -292,9 +297,17 @@ impl App {
         }
     }
 
-    fn open_pasted(&mut self, text: &str) {
+    /// Plays `target`, or shows the channel's videos when it is a YouTube channel address.
+    fn open_target(&mut self, ctx: &egui::Context, target: String) {
+        match browse::channel_url(&target).filter(|_| net::is_url(&target)) {
+            Some(channel) => self.browser.open_channel(ctx, channel),
+            None => self.player.open(target),
+        }
+    }
+
+    fn open_pasted(&mut self, ctx: &egui::Context, text: &str) {
         if let Some(target) = controls::pasted_target(text) {
-            self.player.open(target);
+            self.open_target(ctx, target);
         } else {
             self.show_osd("The clipboard holds no address or file to play");
         }
@@ -325,7 +338,12 @@ impl App {
             })
         });
         if let Some(text) = pasted.filter(|_| !text_focused) {
-            self.open_pasted(&text);
+            self.open_pasted(ctx, &text);
+        }
+        // The YouTube window owns the keys while open: Escape closes it, Space presses its
+        // focused button.
+        if self.browser.open {
+            return;
         }
         let keys: Vec<Key> = ctx.input(|i| {
             i.events
@@ -352,6 +370,7 @@ impl App {
                 }
                 Shortcut::OpenFile => self.open_dialog(),
                 Shortcut::OpenUrl => self.url_open = true,
+                Shortcut::OpenYouTube => self.browser.show_window(),
                 Shortcut::ToggleFullscreen => Self::toggle_fullscreen(ctx),
                 Shortcut::LeaveFullscreen => {
                     if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
@@ -370,7 +389,8 @@ impl App {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         let response = ui.interact(rect, ui.scope_id().with("stage"), egui::Sense::click());
-        let allowed = controls::stage_input_allowed(self.url_open, egui::Popup::is_any_open(ui.ctx()));
+        let dialog = self.url_open || self.browser.open || self.browser.just_closed();
+        let allowed = controls::stage_input_allowed(dialog, egui::Popup::is_any_open(ui.ctx()));
         let action = controls::stage_step(
             &mut self.last_click_paused,
             response.clicked(),
@@ -561,6 +581,9 @@ impl App {
             }
             if ui.button("URL").on_hover_text("Open an address: YouTube, Spotify, radio, file (U)").clicked() {
                 self.url_open = true;
+            }
+            if ui.button("YouTube").on_hover_text("Search YouTube or browse a channel's newest videos (Y)").clicked() {
+                self.browser.show_window();
             }
             let cookie_tip = match self.player.shared.cookies_path() {
                 Some(p) => format!("Cookies file: {}\nClick to choose another", p.display()),
@@ -964,7 +987,7 @@ impl App {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label("YouTube or Spotify link, radio stream, playlist (.m3u / .pls) or media file address:");
+                ui.label("YouTube video or channel, Spotify link, radio stream, playlist (.m3u / .pls) or media file address:");
                 let edit = ui.add(egui::TextEdit::singleline(&mut self.url_text).desired_width(420.0).hint_text("https://…   (Ctrl+V to paste)"));
                 edit.request_focus();
                 let enter = ui.input(|i| i.key_pressed(Key::Enter));
@@ -981,7 +1004,7 @@ impl App {
         if submit {
             let url = self.url_text.trim().to_string();
             if net::is_url(&url) {
-                self.player.open(url);
+                self.open_target(ctx, url);
                 open = false;
             }
         }
@@ -1027,7 +1050,7 @@ impl eframe::App for App {
         let idle = self.last_motion.elapsed();
         // Never hide the controls from under a slider being dragged or an open menu.
         let interacting = self.seek_drag.is_some() || ctx.egui_is_using_pointer() || ctx.any_popup_open();
-        let auto_hide = status.video.is_some() && playing && !self.url_open && !interacting;
+        let auto_hide = status.video.is_some() && playing && !self.url_open && !self.browser.open && !interacting;
         let controls_shown = !auto_hide || idle < CONTROLS_HIDE_AFTER;
         self.draw_stage(ui, &status, controls_shown);
 
@@ -1045,6 +1068,9 @@ impl eframe::App for App {
         }
         if self.url_open {
             self.draw_url_dialog(&ctx);
+        }
+        if let Some(url) = self.browser.show(&ctx, youtube::video_id(&status.source).as_deref()) {
+            self.player.open(url);
         }
         let windowed = ctx.input(|i| !corner::defer_placement(i.viewport().fullscreen.unwrap_or(false), i.viewport().maximized.unwrap_or(false)));
         if let Some(c) = self.corner_pending.filter(|_| windowed) {

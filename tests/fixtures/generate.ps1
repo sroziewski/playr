@@ -70,6 +70,11 @@ Run ((Video 2) + (Sine 2) + @('-c:v', 'libvpx-vp9', '-b:v', '200k', '-deadline',
 # Neither track has a decoder: Motion JPEG picture, AC-3 sound.
 Run ((Video 2) + (Sine 2 48000) + @('-c:v', 'mjpeg', '-q:v', '8', '-pix_fmt', 'yuvj420p', '-c:a', 'ac3', '-b:a', '96k') + $bitexact + "$here\mjpeg_ac3.avi")
 
+# --- still pictures ------------------------------------------------------------------------
+# One JPEG of a single colour, RGB (60, 140, 220), 50x30 (not a whole number of 8x8 blocks),
+# for the YouTube browser's thumbnail decoder.
+Run @('-f', 'lavfi', '-i', 'color=c=0x3C8CDC:size=50x30:duration=1', '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj444p', '-update', '1', '-map_metadata', '-1', '-fflags', '+bitexact', '-flags:v', '+bitexact', "$here\solid_50x30.jpg")
+
 # --- audio only (3 s) ----------------------------------------------------------------------
 Run ((Sine 3) + @('-c:a', 'flac', '-ac', '2') + $bitexact + "$here\sine.flac")
 Run ((Sine 3) + @('-c:a', 'libmp3lame', '-b:a', '128k', '-ac', '2') + $bitexact + "$here\sine.mp3")
