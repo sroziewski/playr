@@ -29,6 +29,7 @@ pub mod sites;
 pub mod spotify;
 pub mod stretch;
 pub mod subtitles;
+pub mod tray;
 pub mod ts;
 pub mod ui;
 pub mod ui_browse;

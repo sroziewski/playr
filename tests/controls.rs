@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, Pos2, Rect, Shape, pos2, vec2};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, Shape, epaint::ColorMode, pos2, vec2};
 use playr::controls::{
     CHAIN_WINDOW, DEFAULT_STEP, Icon, SKIP_STEPS, SPEEDS, Shortcut, SkipChain, icon_button, no_skip_reason, paint_icon,
     pasted_target, shortcut, skip_label, skip_target, speed_after, speed_label, step_after, step_label,
@@ -315,7 +315,7 @@ fn speed_after_clamps_speeds_outside_the_range_into_it() {
     assert_eq!(speed_after(0.1, -1), 0.25);
 }
 
-const BOUND_KEYS: [(Key, Shortcut); 17] = [
+const BOUND_KEYS: [(Key, Shortcut); 18] = [
     (Key::Space, Shortcut::PlayPause),
     (Key::ArrowLeft, Shortcut::SkipBack),
     (Key::ArrowRight, Shortcut::SkipForward),
@@ -333,6 +333,7 @@ const BOUND_KEYS: [(Key, Shortcut); 17] = [
     (Key::Comma, Shortcut::Slower),
     (Key::Period, Shortcut::Faster),
     (Key::C, Shortcut::ToggleCaptions),
+    (Key::T, Shortcut::ToTray),
 ];
 
 #[test]
@@ -352,7 +353,7 @@ fn every_other_key_gives_no_shortcut() {
     let unbound: Vec<Key> = Key::ALL.iter().copied().filter(|k| !BOUND_KEYS.iter().any(|(b, _)| b == k)).collect();
     let bound_hits: Vec<(Key, Shortcut)> = unbound.iter().filter_map(|&k| shortcut(k, false).map(|s| (k, s))).collect();
 
-    assert_eq!(unbound.len(), Key::ALL.len() - 17, "17 distinct keys are bound");
+    assert_eq!(unbound.len(), Key::ALL.len() - 18, "18 distinct keys are bound");
     for key in [Key::A, Key::Enter, Key::F11, Key::Tab, Key::Num5] {
         assert!(unbound.contains(&key), "{key:?} must be among the unbound keys tested");
     }
@@ -364,6 +365,7 @@ fn no_key_is_a_shortcut_while_a_text_field_has_focus() {
     let hits: Vec<(Key, Shortcut)> = Key::ALL.iter().filter_map(|&k| shortcut(k, true).map(|s| (k, s))).collect();
 
     assert!(Key::ALL.contains(&Key::F) && Key::ALL.contains(&Key::F12) && Key::ALL.contains(&Key::Space) && Key::ALL.contains(&Key::Y));
+    assert!(Key::ALL.contains(&Key::T), "T (to tray) must be among the keys tested");
     assert_eq!(hits, Vec::<(Key, Shortcut)>::new());
 }
 
@@ -425,6 +427,8 @@ enum Drawn {
     Polygon(Vec<Pos2>),
     Rect(Rect),
     Line([Pos2; 2], f32),
+    /// A stroked path that is not filled (`Shape::line`).
+    Polyline(Vec<Pos2>, f32),
 }
 
 fn flatten(shape: Shape, out: &mut Vec<Shape>) {
@@ -449,6 +453,9 @@ fn painted(icon: Icon) -> Vec<Drawn> {
         .into_iter()
         .filter_map(|shape| match shape {
             Shape::Path(p) if p.fill == INK => Some(Drawn::Polygon(p.points)),
+            Shape::Path(p) if p.fill == Color32::TRANSPARENT && p.stroke.color == ColorMode::Solid(INK) => {
+                Some(Drawn::Polyline(p.points, p.stroke.width))
+            }
             Shape::Rect(r) if r.fill == INK => Some(Drawn::Rect(r.rect)),
             Shape::LineSegment { points, stroke } if stroke.color == INK => Some(Drawn::Line(points, stroke.width)),
             _ => None,
@@ -456,8 +463,15 @@ fn painted(icon: Icon) -> Vec<Drawn> {
         .collect()
 }
 
-const ALL_ICONS: [Icon; 6] =
-    [Icon::Play, Icon::Pause, Icon::SkipBack, Icon::SkipForward, Icon::EnterFullscreen, Icon::ExitFullscreen];
+const ALL_ICONS: [Icon; 7] = [
+    Icon::Play,
+    Icon::Pause,
+    Icon::SkipBack,
+    Icon::SkipForward,
+    Icon::EnterFullscreen,
+    Icon::ExitFullscreen,
+    Icon::ToTray,
+];
 
 #[test]
 fn every_icon_draws_in_its_colour_inside_its_rect() {
@@ -474,6 +488,7 @@ fn every_icon_draws_in_its_colour_inside_its_rect() {
                 Drawn::Polygon(p) => (p.clone(), 0.0),
                 Drawn::Rect(r) => (vec![r.min, r.max], 0.0),
                 Drawn::Line(p, w) => (p.to_vec(), w / 2.0),
+                Drawn::Polyline(p, w) => (p.clone(), w / 2.0),
             };
             let allowed = rect.expand(slack + 0.01);
             for p in points {
@@ -547,4 +562,37 @@ fn enter_fullscreen_brackets_sit_in_the_corners_and_exit_brackets_do_not() {
 
     assert_eq!(touched(Icon::EnterFullscreen), corners.to_vec());
     assert_eq!(touched(Icon::ExitFullscreen), Vec::<Pos2>::new());
+}
+
+#[test]
+fn to_tray_is_an_arrow_pointing_down_into_a_tray_open_at_the_top() {
+    let rect = icon_rect();
+    let drawn = painted(Icon::ToTray);
+    let heads: Vec<&Vec<Pos2>> = drawn.iter().filter_map(|d| if let Drawn::Polygon(p) = d { Some(p) } else { None }).collect();
+    let trays: Vec<&Vec<Pos2>> = drawn.iter().filter_map(|d| if let Drawn::Polyline(p, _) = d { Some(p) } else { None }).collect();
+
+    assert_eq!(heads.len(), 1, "one arrowhead: {drawn:?}");
+    let head = heads[0];
+    assert_eq!(head.len(), 3, "the arrowhead is a triangle: {head:?}");
+    let tip = head.iter().copied().max_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
+    let back: Vec<Pos2> = head.iter().copied().filter(|p| *p != tip).collect();
+    assert!(back.iter().all(|p| p.y < tip.y - 0.01), "the arrowhead points down: {head:?}");
+    assert!((tip.x - rect.center().x).abs() < 0.01, "the arrow is centred: {head:?}");
+
+    let shafts: Vec<[Pos2; 2]> = drawn.iter().filter_map(|d| if let Drawn::Line(p, _) = d { Some(*p) } else { None }).collect();
+    assert_eq!(shafts.len(), 1, "one shaft: {drawn:?}");
+    let [from, to] = shafts[0];
+    let (upper, lower) = if from.y <= to.y { (from, to) } else { (to, from) };
+    assert!(upper.distance(pos2(rect.center().x, rect.top())) < 0.01, "the shaft starts at the top centre: {:?}", shafts[0]);
+    assert!((lower.x - rect.center().x).abs() < 0.01, "the shaft is vertical: {:?}", shafts[0]);
+    let back_y = back[0].y.min(back[1].y);
+    assert!(lower.y >= back_y - 0.01 && lower.y <= tip.y + 0.01, "the shaft runs into the arrowhead: {:?}, head {head:?}", shafts[0]);
+
+    assert_eq!(trays.len(), 1, "one tray: {drawn:?}");
+    let tray = trays[0];
+    let has = |c: Pos2| tray.iter().any(|p| p.distance(c) < 0.01);
+    assert!(has(rect.left_bottom()) && has(rect.right_bottom()), "the tray spans the bottom corners: {tray:?}");
+    let (first, last) = (tray[0], tray[tray.len() - 1]);
+    assert!(first.y < rect.bottom() - 0.01 && last.y < rect.bottom() - 0.01, "the tray is open at the top: {tray:?}");
+    assert!(tip.y >= first.y - 0.01 && tip.y >= last.y - 0.01, "the arrow reaches the tray's rim: tip {tip:?}, tray {tray:?}");
 }

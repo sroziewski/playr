@@ -1,6 +1,6 @@
 //! Pure parsing in `playr::net`: ICY metadata, playlists, URL / name / MIME classification.
 
-use playr::net::{is_playlist_name, is_url, mime_to_ext, parse_playlist, parse_stream_title};
+use playr::net::{blocked_by_network, is_playlist_name, is_url, mime_to_ext, parse_playlist, parse_stream_title};
 
 mod stream_title {
     use super::*;
@@ -169,5 +169,51 @@ fn mime_to_ext_maps_media_types_to_demuxer_hints() {
     ];
     for (mime, expected) in cases {
         assert_eq!(mime_to_ext(mime), expected, "mime_to_ext({mime:?})");
+    }
+}
+
+#[test]
+fn every_sign_of_an_intercepted_connection_is_explained_as_blocked() {
+    let cases = [
+        (
+            "curl via yt-dlp: unable to get local issuer certificate",
+            "[PornHub] 654afff4c9d2b: Unable to download webpage: Failed to perform, curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20). See https://curl.se/libcurl/c/libcurl-errors.html first for more details.",
+        ),
+        ("rustls: UnknownIssuer", "io: invalid peer certificate: UnknownIssuer"),
+        (
+            "OpenSSL 3 / Python: self-signed certificate in certificate chain",
+            "<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1006)>",
+        ),
+        (
+            "OpenSSL 1.1 / Python: self signed certificate in certificate chain",
+            "<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:1123)>",
+        ),
+        ("the sign alone", "unable to get local issuer certificate"),
+    ];
+    let messages: Vec<(&str, Option<String>)> = cases.iter().map(|(name, err)| (*name, blocked_by_network(err))).collect();
+
+    let wrong: Vec<&(&str, Option<String>)> =
+        messages.iter().filter(|(_, msg)| !msg.as_deref().is_some_and(|m| m.starts_with("Blocked by your network"))).collect();
+    assert!(wrong.is_empty(), "not explained as blocked: {wrong:?}");
+    // Whichever tool reported it, the user is told the same thing.
+    let first = &messages[0].1;
+    let different: Vec<&(&str, Option<String>)> = messages.iter().filter(|(_, msg)| msg != first).collect();
+    assert!(different.is_empty(), "messages differ from {first:?}: {different:?}");
+}
+
+#[test]
+fn certificate_problems_that_are_not_interception_keep_their_own_error() {
+    for err in [
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1006)",
+        "invalid peer certificate: NotValidForName",
+        "invalid peer certificate: Expired",
+        // A self-signed server certificate (depth 0) is not a filter's chain.
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate (_ssl.c:1123)",
+        // OpenSSL error 2, not 20: the issuer is missing, not untrusted.
+        "SSL certificate OpenSSL verify result: unable to get issuer certificate (2)",
+        "HTTP Error 404: Not Found",
+        "",
+    ] {
+        assert_eq!(blocked_by_network(err), None, "{err}");
     }
 }

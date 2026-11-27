@@ -18,6 +18,8 @@ symphonia-adapter-opus-rs = "0.1.1"
 # TLS without ring (which compiles C and assembly): rustls with a pure-Rust crypto provider.
 rustls-rustcrypto = "0.1.0-pre.0"
 quick-xml = "0.41.0"
+# The window handle, which "To tray" hides and shows through Win32.
+raw-window-handle = "0.6"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
@@ -25,7 +27,13 @@ ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-pro
 zune-jpeg = "0.5.15"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+# The notification-area icon of "To tray" (no default features: those are Linux GTK).
+tray-icon = { version = "0.27.0", default-features = false }
+
+# Tests that make a real window to hide to the tray.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
 
 [build-dependencies]
 # Embeds assets/playr.ico into playr.exe; does nothing when the target is not Windows.

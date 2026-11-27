@@ -974,3 +974,81 @@ fn while_a_feed_episode_opens_the_title_says_opening_it_not_finding_it_on_youtub
     assert!(!loading_titles.iter().any(|t| t.starts_with("Finding")), "{loading_titles:?}");
     assert_eq!(last.info, "Spotify · Zosia Cebulka - bajki do snu i zabawy · 2/3 · podcast feed");
 }
+
+mod blocked_by_network {
+    use super::*;
+
+    /// A yt-dlp stand-in that always fails, writing `stderr.txt` from its folder to stderr.
+    fn failing_ytdlp(dir: &Path, stderr: &str) -> PathBuf {
+        std::fs::write(dir.join("stderr.txt"), stderr).unwrap();
+        if cfg!(windows) {
+            let path = dir.join("yt-dlp.cmd");
+            std::fs::write(&path, "@echo off\r\ntype \"%~dp0stderr.txt\" 1>&2\r\nexit /b 1\r\n").unwrap();
+            path
+        } else {
+            let path = dir.join("yt-dlp");
+            std::fs::write(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+    }
+
+    /// Runs `test` in a child whose yt-dlp fails with `stderr`.
+    fn in_child_failing_with(test: &str, folder: &str, stderr: &str) -> bool {
+        if is_child() {
+            return true;
+        }
+        let dir = fresh_dir(folder);
+        let mut env = private_env(&dir);
+        env.push(("PLAYR_YTDLP", failing_ytdlp(&dir, stderr).into_os_string()));
+        run_child(test, env);
+        false
+    }
+
+    fn failed_open(player: &Player) -> Status {
+        player.open(URL);
+        wait_for_status(player, "the video to fail", |s| s.source == URL && !matches!(s.state, State::Idle | State::Loading))
+    }
+
+    #[test]
+    fn a_youtube_video_behind_a_web_filter_fails_with_the_blocked_message() {
+        let stderr = "ERROR: [youtube] aB3_-x9Zq0Y: Unable to download webpage: Failed to perform, curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20). See https://curl.se/libcurl/c/libcurl-errors.html first for more details.\n";
+        if !in_child_failing_with("blocked_by_network::a_youtube_video_behind_a_web_filter_fails_with_the_blocked_message", "player_blocked", stderr) {
+            return;
+        }
+        let player = Player::new(Box::new(|| {}));
+        player.shared.audio.set_volume(0.0);
+
+        let status = failed_open(&player);
+
+        assert_eq!(status.state, State::Failed, "{status:?}");
+        let error = status.error.unwrap_or_default();
+        assert!(error.starts_with("Blocked by your network"), "{error}");
+        // The same explanation whichever tool reported the interception.
+        assert_eq!(Some(error), playr::net::blocked_by_network("invalid peer certificate: UnknownIssuer"));
+    }
+
+    #[test]
+    fn an_expired_certificate_keeps_ytdlps_own_error() {
+        let stderr = "ERROR: [youtube] aB3_-x9Zq0Y: Unable to download webpage: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1006)\n";
+        if !in_child_failing_with("blocked_by_network::an_expired_certificate_keeps_ytdlps_own_error", "player_expired", stderr) {
+            return;
+        }
+        let player = Player::new(Box::new(|| {}));
+        player.shared.audio.set_volume(0.0);
+
+        let status = failed_open(&player);
+
+        assert_eq!(status.state, State::Failed, "{status:?}");
+        let error = status.error.unwrap_or_default();
+        // How the player words the rest of the error is not part of this rule; yt-dlp's reason must survive.
+        assert!(
+            error.contains("certificate verify failed: certificate has expired") && !error.starts_with("Blocked by your network"),
+            "{error}"
+        );
+    }
+}

@@ -138,6 +138,7 @@ pub enum Shortcut {
     Slower,
     Faster,
     ToggleCaptions,
+    ToTray,
 }
 
 /// The shortcut bound to `key`. While a text field has focus the keys belong to the text
@@ -163,6 +164,7 @@ pub fn shortcut(key: Key, text_field_focused: bool) -> Option<Shortcut> {
         Key::Comma => Shortcut::Slower,
         Key::Period => Shortcut::Faster,
         Key::C => Shortcut::ToggleCaptions,
+        Key::T => Shortcut::ToTray,
         _ => return None,
     })
 }
@@ -215,6 +217,7 @@ pub enum Icon {
     SkipForward,
     EnterFullscreen,
     ExitFullscreen,
+    ToTray,
 }
 
 /// A button showing `icon` (and `text` after it, if any). A disabled one ignores clicks and
@@ -277,6 +280,14 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 };
                 painter.add(triangle(points));
             }
+        }
+        Icon::ToTray => {
+            // An arrow down into an open tray.
+            let stroke = Stroke::new(1.8, color);
+            let (cx, tray_top) = (rect.center().x, t + h * 0.62);
+            painter.line_segment([pos2(cx, t), pos2(cx, t + h * 0.5)], stroke);
+            painter.add(triangle(vec![pos2(cx - w * 0.22, t + h * 0.36), pos2(cx + w * 0.22, t + h * 0.36), pos2(cx, t + h * 0.62)]));
+            painter.add(egui::Shape::line(vec![pos2(l, tray_top), pos2(l, b), pos2(r, b), pos2(r, tray_top)], stroke));
         }
         Icon::EnterFullscreen | Icon::ExitFullscreen => {
             // Four corner brackets: pointing out to enter full screen, in to leave it.

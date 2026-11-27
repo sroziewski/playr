@@ -115,6 +115,14 @@ pub struct Shared {
     repaint: Box<dyn Fn() + Send + Sync>,
 }
 
+impl Status {
+    /// Marks playing as failed with `error`, explained as a block when a web filter caused it.
+    fn set_failed(&mut self, error: String) {
+        self.state = State::Failed;
+        self.error = Some(crate::net::blocked_by_network(&error).unwrap_or(error));
+    }
+}
+
 impl Shared {
     fn new(repaint: Box<dyn Fn() + Send + Sync>) -> Self {
         Self {
@@ -167,10 +175,7 @@ impl Shared {
 
     fn fail(&self, error: String) {
         self.set_paused(true);
-        self.update_status(|st| {
-            st.state = State::Failed;
-            st.error = Some(error);
-        });
+        self.update_status(|st| st.set_failed(error));
     }
 
     /// Current playback position in seconds.
@@ -1336,8 +1341,7 @@ impl Session {
             let broken = self.read_error.take().filter(|_| nothing_played);
             shared.update_status(|st| {
                 if let Some(e) = broken {
-                    st.state = State::Failed;
-                    st.error = Some(e);
+                    st.set_failed(e);
                 } else if lost {
                     st.state = State::Failed;
                     st.error = Some("the stream ended".into());

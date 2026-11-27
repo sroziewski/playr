@@ -62,6 +62,7 @@ pub struct App {
     history_checking: Arc<AtomicBool>,
     bitrate_shown: Option<bitrate::Display>,
     browser: Browser,
+    tray: crate::tray::Tray,
 }
 
 #[derive(Default)]
@@ -82,6 +83,7 @@ impl App {
         if let Some(path) = privacy::settings_path() {
             privacy::set_https_only(privacy::load(&path));
         }
+        let tray = crate::tray::Tray::new(window_handle(cc), player.shared.clone());
         let mut app = Self {
             player,
             renderer: Arc::new(Mutex::new(VideoRenderer::default())),
@@ -109,6 +111,7 @@ impl App {
             history_checking: Arc::new(AtomicBool::new(false)),
             bitrate_shown: None,
             browser: Browser::default(),
+            tray,
         };
         if let Some(target) = initial {
             app.open_target(&cc.egui_ctx, target);
@@ -313,6 +316,14 @@ impl App {
         }
     }
 
+    /// Hides the window to the tray, playing on; where there is no tray, minimizes it.
+    fn to_tray(&mut self, ctx: &egui::Context) {
+        if let Some((osd, command)) = crate::tray::when_hidden(self.tray.hide(&self.last_title)) {
+            self.show_osd(osd);
+            ctx.send_viewport_cmd(command);
+        }
+    }
+
     fn toggle_fullscreen(ctx: &egui::Context) {
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
@@ -381,6 +392,7 @@ impl App {
                 Shortcut::Faster if status.seekable => self.set_speed(controls::speed_after(self.player.shared.speed(), 1)),
                 Shortcut::Slower | Shortcut::Faster => {}
                 Shortcut::ToggleCaptions => self.toggle_captions(ctx, status),
+                Shortcut::ToTray => self.to_tray(ctx),
             }
         }
     }
@@ -623,6 +635,10 @@ impl App {
             }
             self.playlist_controls(ui, status);
             self.bitrate_label(ui, ctx, status);
+            if icon_button(ui, Icon::ToTray, "", true).on_hover_text("Hide to the tray, playing on (T)
+Click the tray icon to bring playr back").clicked() {
+                self.to_tray(ctx);
+            }
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             let (icon, tip) = if fullscreen {
                 (Icon::ExitFullscreen, "Exit full screen (F12, F, Esc)")
@@ -1081,6 +1097,15 @@ impl eframe::App for App {
         {
             self.place_in_corner(&ctx, c, aspect);
         }
+    }
+}
+
+/// The native handle of the window (an HWND on Windows), for hiding it to the tray.
+fn window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
     }
 }
 

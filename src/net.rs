@@ -16,6 +16,22 @@ pub fn is_url(s: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// What a failed connection means when the site's certificate came from an authority nobody
+/// trusts: on a working network that is a web filter (a company firewall such as FortiGate)
+/// answering in the site's place with its own certificate and a block page. Certificates that
+/// are merely expired or for another name are not interception and are left as they are.
+pub fn blocked_by_network(error: &str) -> Option<String> {
+    const SIGNS: [&str; 4] = [
+        "unable to get local issuer certificate",
+        "self signed certificate in certificate chain",
+        "self-signed certificate in certificate chain",
+        "UnknownIssuer",
+    ];
+    SIGNS.iter().any(|s| error.contains(s)).then(|| {
+        "Blocked by your network: the connection to this site was intercepted (its certificate is not from a trusted authority), most likely by a company or school web filter. It should play on another network.".to_string()
+    })
+}
+
 /// Extracts `StreamTitle` from an ICY metadata block (`StreamTitle='Artist - Song';...`).
 /// Returns `None` when the field is absent or empty.
 pub fn parse_stream_title(meta: &[u8]) -> Option<String> {
