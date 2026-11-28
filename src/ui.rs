@@ -83,7 +83,10 @@ impl App {
         if let Some(path) = privacy::settings_path() {
             privacy::set_https_only(privacy::load(&path));
         }
-        let tray = crate::tray::Tray::new(window_handle(cc), player.shared.clone());
+        #[allow(unused_mut)]
+        let mut tray = crate::tray::Tray::new(window_handle(cc), player.shared.clone());
+        #[cfg(target_os = "linux")]
+        tray.attach(&cc.egui_ctx, on_wayland(cc));
         let mut app = Self {
             player,
             renderer: Arc::new(Mutex::new(VideoRenderer::default())),
@@ -1100,13 +1103,22 @@ impl eframe::App for App {
     }
 }
 
-/// The native handle of the window (an HWND on Windows), for hiding it to the tray.
+/// The native handle of the window (an HWND on Windows, the window id on X11), for hiding
+/// it to the tray.
 fn window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match cc.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        RawWindowHandle::Xlib(h) => Some(h.window as isize),
+        RawWindowHandle::Xcb(h) => Some(h.window.get() as isize),
         _ => None,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn on_wayland(cc: &eframe::CreationContext<'_>) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    cc.window_handle().is_ok_and(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)))
 }
 
 /// The window and taskbar icon, decoded from `assets/playr.png`.

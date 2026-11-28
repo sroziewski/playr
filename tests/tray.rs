@@ -249,7 +249,7 @@ mod hide {
         assert_eq!(results, [Hidden::Unavailable(why.clone()), Hidden::Unavailable(why)]);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
     fn elsewhere_there_is_no_tray_even_with_a_window_handle() {
         let s = start();
@@ -407,6 +407,112 @@ mod hide {
             })
             .join()
             .expect("the thread's assertions");
+        }
+    }
+
+    /// Linux: the icon is a StatusNotifierItem on the session D-Bus, and the window is hidden
+    /// and shown through egui viewport commands, here on an egui context of the test's own.
+    #[cfg(target_os = "linux")]
+    mod linux_window {
+        use super::*;
+        use eframe::egui::{Context, RawInput, ViewportId};
+        use playr::tray::{act, argb_icon};
+
+        /// The viewport commands `ctx` was asked for since the last call, without the theme egui
+        /// sets on its own first pass.
+        fn commands(ctx: &Context) -> Vec<ViewportCommand> {
+            let out = ctx.run_ui(RawInput::default(), |_| {});
+            let all = out.viewport_output.get(&ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default();
+            all.into_iter().filter(|c| !matches!(c, ViewportCommand::SetTheme(_))).collect()
+        }
+
+        const CHILD: &str = "PLAYR_TEST_CHILD";
+
+        /// Runs `test` alone in a copy of this binary with `env` added and returns false; in that
+        /// copy returns true, and the caller runs the test body.
+        fn in_child(test: &str, env: &[(&str, &str)]) -> bool {
+            if std::env::var_os(CHILD).is_some() {
+                return true;
+            }
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .envs(env.iter().copied())
+                .output()
+                .expect("start the child test");
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success(), "{test} failed in the child process:\n{stdout}\n{stderr}");
+            assert!(stdout.contains("test result: ok. 1 passed"), "{test} did not run in the child process:\n{stdout}");
+            false
+        }
+
+        #[test]
+        fn the_icon_is_the_window_icon_in_argb_network_order() {
+            let rgba = [0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xff];
+            assert_eq!(argb_icon(&rgba), [0x44, 0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc]);
+        }
+
+        #[test]
+        fn on_wayland_the_window_cannot_hide_and_is_left_alone() {
+            let s = start();
+            let ctx = Context::default();
+            let mut tray = Tray::new(None, s.player.shared.clone());
+            tray.attach(&ctx, true);
+
+            let hidden = tray.hide("Song — playr");
+
+            assert_eq!(hidden, Hidden::Unavailable("on Wayland a window cannot hide itself".into()));
+            assert_eq!(commands(&ctx), []);
+        }
+
+        #[test]
+        fn before_the_window_is_attached_there_is_no_tray() {
+            let s = start();
+            let mut tray = Tray::new(Some(0x5a17), s.player.shared.clone());
+
+            assert_eq!(tray.hide("Song — playr"), Hidden::Unavailable("the window is not ready".into()));
+        }
+
+        #[test]
+        fn without_a_message_bus_the_reason_is_given_and_the_window_stays() {
+            let test = "hide::linux_window::without_a_message_bus_the_reason_is_given_and_the_window_stays";
+            if !in_child(test, &[("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/playr-test-bus")]) {
+                return;
+            }
+            let s = start();
+            let ctx = Context::default();
+            let mut tray = Tray::new(Some(0x5a17), s.player.shared.clone());
+            tray.attach(&ctx, false);
+
+            let hidden = tray.hide("Song — playr");
+
+            let Hidden::Unavailable(why) = &hidden else { panic!("hidden without a tray: {hidden:?}") };
+            assert!(why.starts_with("cannot reach the desktop's message bus (D-Bus)"), "{why}");
+            assert_eq!(commands(&ctx), []);
+        }
+
+        /// Needs a desktop that shows tray icons (KDE, or GNOME with the AppIndicator extension);
+        /// elsewhere it checks only that the window is left alone. The icon shows for a moment.
+        #[test]
+        fn hiding_shows_the_icon_and_the_icon_shows_the_window_and_quits() {
+            let s = start();
+            let ctx = Context::default();
+            let mut tray = Tray::new(Some(0x5a17), s.player.shared.clone());
+            tray.attach(&ctx, false);
+
+            match tray.hide("Song — playr") {
+                Hidden::Unavailable(why) => {
+                    eprintln!("no tray on this desktop ({why}); only the fallback is checked");
+                    assert_eq!(commands(&ctx), []);
+                }
+                Hidden::ToTray => {
+                    assert_eq!(commands(&ctx), [ViewportCommand::Visible(false)]);
+                    act(Action::Show);
+                    assert_eq!(commands(&ctx), [ViewportCommand::Visible(true), ViewportCommand::Focus]);
+                    act(Action::Quit);
+                    assert_eq!(commands(&ctx), [ViewportCommand::Close]);
+                }
+            }
         }
     }
 }

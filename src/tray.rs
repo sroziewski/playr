@@ -1,8 +1,12 @@
 //! Hiding the window to the notification area ("tray") while playing goes on.
 //!
-//! The tray's handlers, called on the main thread by the message loop winit pumps, show and
-//! close the window through Win32 at once, rather than asking the app to on its next frame:
-//! a hidden window's frames come slowly and may not come at all.
+//! On Windows the tray's handlers, called on the main thread by the message loop winit pumps,
+//! show and close the window through Win32 at once, rather than asking the app to on its next
+//! frame: a hidden window's frames come slowly and may not come at all.
+//! On Linux the icon is a StatusNotifierItem on D-Bus (KDE, and GNOME with the AppIndicator
+//! extension Ubuntu turns on), whose handlers run on a thread of their own: they ask the window
+//! to show or close through egui and wake it, and eframe carries such requests out for a
+//! hidden window too. X11 only: Wayland does not let a window hide itself.
 //! Playing needs no frames: sound, the clock and the playlist run on the player's threads.
 
 use std::sync::Arc;
@@ -232,11 +236,174 @@ mod windows_tray {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use linux_tray::{Tray, act, argb_icon};
+
+#[cfg(target_os = "linux")]
+mod linux_tray {
+    use std::sync::Mutex;
+
+    use eframe::egui::{Context, ViewportCommand};
+    use ksni::blocking::{Handle, TrayMethods};
+    use ksni::menu::{MenuItem, StandardItem};
+
+    use super::{Action, Arc, Hidden, Shared, toggle_pause, tooltip};
+
+    /// What the tray's handlers act on. They run on the tray's own thread, and the icon is
+    /// made on each hide and taken down on each show, so it lives here rather than in [`Tray`].
+    struct Target {
+        ctx: Context,
+        shared: Arc<Shared>,
+        icon: Option<Handle<Item>>,
+    }
+
+    static TARGET: Mutex<Option<Target>> = Mutex::new(None);
+
+    /// Does `action` as a click on the tray icon or its menu would. Nothing happens before the
+    /// first [`Tray::hide`].
+    pub fn act(action: Action) {
+        let (ctx, shared, icon) = {
+            let mut target = TARGET.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(t) = target.as_mut() else { return };
+            let icon = if action == Action::TogglePause { None } else { t.icon.take() };
+            (t.ctx.clone(), t.shared.clone(), icon)
+        };
+        // Called from the icon's own click handler, the icon must first answer the click: taken
+        // down at once, it would leave the desktop's call without a reply.
+        if let Some(icon) = icon {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                icon.shutdown().wait();
+            });
+        }
+        match action {
+            Action::TogglePause => toggle_pause(&shared),
+            Action::Show => {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+        }
+        // A hidden window draws no frames of its own accord: wake it to carry the request out.
+        ctx.request_repaint();
+    }
+
+    /// `picture` (RGBA rows) as the ARGB32, network byte order, a StatusNotifierItem carries.
+    pub fn argb_icon(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect()
+    }
+
+    struct Item {
+        tooltip: String,
+        icon: ksni::Icon,
+    }
+
+    impl ksni::Tray for Item {
+        fn id(&self) -> String {
+            "playr".into()
+        }
+
+        fn title(&self) -> String {
+            "playr".into()
+        }
+
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            vec![self.icon.clone()]
+        }
+
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip { title: self.tooltip.clone(), ..Default::default() }
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            act(Action::Show);
+        }
+
+        fn menu(&self) -> Vec<MenuItem<Self>> {
+            let item = |label: &str, action: Action| {
+                StandardItem { label: label.into(), activate: Box::new(move |_: &mut Self| act(action)), ..Default::default() }
+                    .into()
+            };
+            vec![
+                item("Show playr", Action::Show),
+                item("Play / Pause", Action::TogglePause),
+                MenuItem::Separator,
+                item("Quit", Action::Quit),
+            ]
+        }
+
+        /// The desktop stopped showing tray icons (its tray extension was turned off, or the
+        /// shell restarted): bring the window back rather than leave it out of reach.
+        fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+            act(Action::Show);
+            false
+        }
+    }
+
+    fn reason(e: &ksni::Error) -> String {
+        match e {
+            ksni::Error::Dbus(e) => format!("cannot reach the desktop's message bus (D-Bus): {e}"),
+            // No watcher, no host to show the icon, and any reason a later ksni adds.
+            _ => "the desktop shows no tray icons (on GNOME, turn on the AppIndicator extension)".into(),
+        }
+    }
+
+    /// The tray of playr's window.
+    pub struct Tray {
+        window: Option<isize>,
+        shared: Arc<Shared>,
+        ctx: Option<Context>,
+        wayland: bool,
+    }
+
+    impl Tray {
+        /// `window` is the window's X11 id, `None` when it could not be had.
+        pub fn new(window: Option<isize>, shared: Arc<Shared>) -> Self {
+            Tray { window, shared, ctx: None, wayland: false }
+        }
+
+        /// The window's egui context, through which it is hidden and shown, and whether it is
+        /// on Wayland.
+        pub fn attach(&mut self, ctx: &Context, wayland: bool) {
+            self.ctx = Some(ctx.clone());
+            self.wayland = wayland;
+        }
+
+        /// Hides the window, showing an icon in the tray whose tooltip is `title`.
+        pub fn hide(&mut self, title: &str) -> Hidden {
+            if self.wayland {
+                return Hidden::Unavailable("on Wayland a window cannot hide itself".into());
+            }
+            if self.window.is_none() {
+                return Hidden::Unavailable("the window handle is unknown".into());
+            }
+            let Some(ctx) = self.ctx.clone() else { return Hidden::Unavailable("the window is not ready".into()) };
+            let picture = crate::ui::window_icon();
+            let icon = ksni::Icon { width: picture.width as i32, height: picture.height as i32, data: argb_icon(&picture.rgba) };
+            // Registering with the desktop's tray takes a D-Bus round trip or two.
+            let handle = match (Item { tooltip: tooltip(title), icon }).spawn() {
+                Ok(h) => h,
+                Err(e) => return Hidden::Unavailable(reason(&e)),
+            };
+            let old = TARGET.lock().unwrap_or_else(|p| p.into_inner()).replace(Target {
+                ctx: ctx.clone(),
+                shared: self.shared.clone(),
+                icon: Some(handle),
+            });
+            if let Some(icon) = old.and_then(|t| t.icon) {
+                icon.shutdown();
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            Hidden::ToTray
+        }
+    }
+}
+
 /// Elsewhere there is no tray: the window is minimized instead.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub struct Tray;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl Tray {
     pub fn new(_hwnd: Option<isize>, _shared: Arc<Shared>) -> Self {
         Tray

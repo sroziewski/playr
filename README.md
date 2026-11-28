@@ -33,6 +33,10 @@ This installs to `~/.local/bin` and adds a desktop entry and icons under `~/.loc
 To make playr the default for a file type, open the file's *Properties > Open With*. To
 uninstall, pass `--uninstall`.
 
+The build needs Rust 1.95 or later (`rustup update stable`). *To tray* (T) shows its icon on
+KDE and on GNOME with the AppIndicator extension, which Ubuntu turns on by default. On Wayland,
+or without a tray, the window is minimized instead.
+
 Both scripts also accept a binary that is already built: `-Binary path\to\playr.exe` on
 Windows, `--binary path/to/playr` on Linux.
 
