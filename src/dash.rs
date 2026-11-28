@@ -24,6 +24,11 @@ pub const CHUNK: u64 = 10 << 20;
 /// A forward jump this short is made by reading through the bytes in between rather than by
 /// opening a new connection, which costs a round trip.
 const SKIP_BY_READING: u64 = 512 << 10;
+/// The bytes last read are kept this far back, so that a backward jump this short is answered
+/// from memory. An MP4 file whose audio and video samples are not stored in time order makes
+/// its demuxer step back a few kilobytes several times a second; each step used to cost a new
+/// request, and such a file played in slow motion.
+const KEEP_BEHIND: usize = 4 << 20;
 /// What is fetched first: enough for the header of every YouTube file seen so far. A longer
 /// header is fetched in full in a second request.
 const HEAD_GUESS: u64 = 256 << 10;
@@ -258,12 +263,15 @@ impl Read for ChunkedReader {
 }
 
 /// A remote file as a seekable [`MediaSource`]. Reading runs a download thread a couple of
-/// megabytes ahead of the reader; a seek that leaves that window starts a new download.
+/// megabytes ahead of the reader, and keeps [`KEEP_BEHIND`] bytes behind the download; a seek
+/// that leaves that window starts a new download.
 pub struct RangeSource {
     fetch: Arc<dyn RangeFetch>,
     len: u64,
     pos: u64,
     pipe: Option<(PipeReader, u64)>,
+    /// The bytes just before the download's position, oldest first.
+    behind: std::collections::VecDeque<u8>,
     abort: Arc<AtomicBool>,
     chunk_size: u64,
 }
@@ -275,7 +283,15 @@ impl RangeSource {
 
     pub fn with_chunk_size(fetch: Arc<dyn RangeFetch>, abort: Arc<AtomicBool>, chunk_size: u64) -> Self {
         let len = fetch.len();
-        Self { fetch, len, pos: 0, pipe: None, abort, chunk_size }
+        Self { fetch, len, pos: 0, pipe: None, behind: std::collections::VecDeque::new(), abort, chunk_size }
+    }
+
+    /// Notes `bytes` as read from the download, keeping the last [`KEEP_BEHIND`] of them.
+    fn keep(&mut self, bytes: &[u8]) {
+        let bytes = &bytes[bytes.len().saturating_sub(KEEP_BEHIND)..];
+        let surplus = (self.behind.len() + bytes.len()).saturating_sub(KEEP_BEHIND);
+        self.behind.drain(..surplus);
+        self.behind.extend(bytes);
     }
 
     /// Byte offset of the next read.
@@ -289,29 +305,47 @@ impl Read for RangeSource {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
-        if let Some((_, at)) = &self.pipe
-            && !(*at <= self.pos && self.pos - *at <= SKIP_BY_READING)
-        {
-            // Dropping the reading end makes the old download thread stop at its next chunk.
-            self.pipe = None;
+        if let Some((_, at)) = &self.pipe {
+            let back = at.checked_sub(self.pos).filter(|&b| b > 0 && b <= self.behind.len() as u64);
+            if let Some(back) = back {
+                // A short step back: from memory.
+                let from = self.behind.len() - back as usize;
+                let n = buf.len().min(back as usize);
+                for (dst, src) in buf[..n].iter_mut().zip(self.behind.range(from..from + n)) {
+                    *dst = *src;
+                }
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            if !(*at <= self.pos && self.pos - *at <= SKIP_BY_READING) {
+                // Dropping the reading end makes the old download thread stop at its next chunk.
+                self.pipe = None;
+                self.behind.clear();
+            }
         }
         if self.pipe.is_none() {
             let reader = ChunkedReader::new(self.fetch.clone(), self.pos, self.chunk_size, self.abort.clone());
             self.pipe = Some((net::spawn_pipe(reader, self.abort.clone()), self.pos));
         }
-        let (pipe, at) = self.pipe.as_mut().expect("set above");
         let mut scratch = [0u8; 8192];
-        while *at < self.pos {
+        loop {
+            let (pipe, at) = self.pipe.as_mut().expect("set above");
+            if *at >= self.pos {
+                break;
+            }
             let want = scratch.len().min((self.pos - *at) as usize);
             let n = pipe.read(&mut scratch[..want])?;
             if n == 0 {
                 return Ok(0);
             }
             *at += n as u64;
+            self.keep(&scratch[..n]);
         }
+        let (pipe, at) = self.pipe.as_mut().expect("set above");
         let n = pipe.read(buf)?;
         *at += n as u64;
         self.pos += n as u64;
+        self.keep(&buf[..n]);
         Ok(n)
     }
 }

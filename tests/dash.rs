@@ -314,7 +314,7 @@ mod range_source {
     }
 
     #[test]
-    fn a_short_jump_forward_reads_through_and_a_longer_one_or_any_jump_back_reconnects() {
+    fn a_short_jump_forward_reads_through_and_a_longer_one_or_a_jump_back_past_what_was_read_reconnects() {
         const SKIP: u64 = 512 << 10;
         let data = pattern(1_600_000);
         let len = data.len() as u64;
@@ -335,6 +335,36 @@ mod range_source {
 
         assert_eq!(opens_after_short_jump, vec![(0, len)], "a jump of exactly 512 KiB reads through");
         assert_eq!(fetch.opens(), vec![(0, len), (200 + 2 * SKIP + 1, len), (50, len)]);
+    }
+
+    /// An MP4 file whose audio and video samples are not stored in time order makes the demuxer
+    /// step back a little many times a second; each step used to open a new request, and the
+    /// file played in slow motion.
+    #[test]
+    fn a_jump_back_within_the_last_4_mib_read_comes_from_memory() {
+        const KEPT: u64 = 4 << 20;
+        let data = pattern(6_000_000);
+        let len = data.len() as u64;
+        let fetch = MemFetch::new(data.clone());
+        let mut source = RangeSource::with_chunk_size(fetch.clone(), no_abort(), 8 << 20);
+        let mut read_at = |source: &mut RangeSource, at: u64, n: usize| {
+            source.seek(SeekFrom::Start(at)).unwrap();
+            let mut buf = vec![0u8; n];
+            source.read_exact(&mut buf).unwrap();
+            assert!(buf[..] == data[at as usize..at as usize + n], "bytes at {at}");
+        };
+
+        read_at(&mut source, 0, 1_000_000);
+        // Back and forth as such a file is read: back a little, on past where the download is.
+        for (back_to, n) in [(990_000, 4000), (994_000, 20_000), (600_000, 500_000), (1_100_000, 10), (0, 100)] {
+            read_at(&mut source, back_to, n);
+        }
+        let opens_within = fetch.opens();
+        read_at(&mut source, 5_500_000, 100);
+        read_at(&mut source, 5_500_100 - KEPT - 1, 100);
+
+        assert_eq!(opens_within, vec![(0, len)], "every step back stayed within what was read");
+        assert_eq!(fetch.opens(), vec![(0, len), (5_500_000, len), (5_500_100 - KEPT - 1, len)]);
     }
 }
 
