@@ -242,6 +242,19 @@ impl Shared {
         c.wall_anchor = (!paused).then(Instant::now);
     }
 
+    /// Drops the queued audio and restarts the clock at `base` on the device, in one step: a
+    /// position read in between would otherwise see the emptied device clock on the old base
+    /// (the start of the file) while playback carries on.
+    fn restart_clock_on_fresh_audio(&self, base: f64) {
+        let paused = self.is_paused();
+        let mut c = self.clock.lock().unwrap();
+        self.audio.reset();
+        c.base = base;
+        c.use_audio = true;
+        c.wall_accum = 0.0;
+        c.wall_anchor = (!paused).then(Instant::now);
+    }
+
     fn set_clock_base(&self, base: f64) {
         self.clock.lock().unwrap().base = base;
     }
@@ -1258,8 +1271,7 @@ impl Session {
         // position, and let the next packet open whatever is the default device now.
         let position = shared.position();
         self.out = None;
-        shared.audio.reset();
-        shared.restart_clock(position, Some(true));
+        shared.restart_clock_on_fresh_audio(position);
         self.on_wall_clock = false;
         self.audio_resume = position;
         self.align_pending = true;
@@ -1445,8 +1457,7 @@ impl Session {
                 // back to the device, continuing from where the wall clock stands.
                 let position = shared.position();
                 self.on_wall_clock = false;
-                shared.audio.reset();
-                shared.restart_clock(position, Some(true));
+                shared.restart_clock_on_fresh_audio(position);
                 self.audio_resume = position;
                 self.align_pending = true;
             }

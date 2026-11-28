@@ -2,13 +2,16 @@
 name = "playr"
 version = "0.1.0"
 edition = "2024"
+# eframe/egui 0.37 and oxideav need this; an older toolchain is updated with `rustup update stable`.
+rust-version = "1.95"
 description = "Light, fast media player: video files, audio files and internet radio, on pure-Rust decoders"
 
 [dependencies]
 # AES-128 for encrypted HLS segments; already built as part of rustls-rustcrypto.
 aes = "0.9.4"
 cpal = "0.18.2"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
+# x11 and wayland are the Linux window backends (winit needs at least one); other systems ignore them.
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard", "x11", "wayland"] }
 oxideav-mpeg4video = "0.1.10"
 rfd = "0.18.0"
 rust_h264 = "0.6.1"

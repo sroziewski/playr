@@ -327,22 +327,55 @@ pub struct AudioOut {
     resampled: Vec<f32>,
 }
 
+/// How long the device may go without asking for sound, while reporting passing errors,
+/// before it is taken for dead (Linux).
+pub const STALL_BEFORE_LOST: Duration = Duration::from_millis(500);
+
+/// Whether a device error, `since` the last time the device asked for sound, means the stream
+/// is dead and must be reopened.
+///
+/// An underrun and a reroute to a new default device never do: the stream carries on (ALSA on
+/// Linux reports every underrun). On Linux the ALSA stream also carries on after any other
+/// error but a lost device; the PulseAudio/PipeWire bridge reports passing I/O errors when
+/// streams come and go, and reopening for each would end playback with "audio device keeps
+/// failing". There such an error counts only once the device has stopped asking for sound.
+pub fn error_kills_stream(kind: cpal::ErrorKind, since: Duration) -> bool {
+    use cpal::ErrorKind::*;
+    match kind {
+        Xrun | DeviceChanged => false,
+        DeviceNotAvailable | StreamInvalidated | HostUnavailable => true,
+        _ if cfg!(target_os = "linux") => since >= STALL_BEFORE_LOST,
+        _ => true,
+    }
+}
+
 impl AudioOut {
     pub fn open(shared: Arc<AudioShared>, src_rate: u32, src_channels: usize) -> Result<Self, String> {
         let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
         let build = |rate: u32, channels: u16| {
             let cb_shared = shared.clone();
             let err_shared = shared.clone();
+            // When the data callback last ran, in milliseconds since the stream was built.
+            let born = Instant::now();
+            let last_render = Arc::new(AtomicU64::new(0));
+            let cb_last_render = last_render.clone();
             let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
             device.build_output_stream(
                 config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let t = info.timestamp();
-                    cb_shared.render_at(data, Instant::now(), t.playback.duration_since(t.callback));
+                    let now = Instant::now();
+                    cb_last_render.store((now - born).as_millis() as u64, Ordering::Relaxed);
+                    cb_shared.render_at(data, now, t.playback.duration_since(t.callback));
                 },
                 // After an error the callback may never run again, which would freeze the
                 // clock; the pipeline reopens the device when it sees this flag.
-                move |_err| err_shared.flag_device_error(),
+                move |err: cpal::Error| {
+                    let since = (Instant::now() - born).saturating_sub(Duration::from_millis(last_render.load(Ordering::Relaxed)));
+                    if error_kills_stream(err.kind(), since) {
+                        err_shared.flag_device_error()
+                    }
+                },
                 None,
             )
         };

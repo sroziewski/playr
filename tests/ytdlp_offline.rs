@@ -63,7 +63,7 @@ fn test_dir() -> PathBuf {
     PathBuf::from(std::env::var_os(DIR).expect("PLAYR_TEST_DIR"))
 }
 
-/// The environment of a child: its folder, a private data folder and, on Windows, a `PATH`
+/// The environment of a child: its folder, a private data folder and a `PATH`
 /// holding only `bin` (so which JavaScript runtimes exist is up to the test).
 fn child_env(dir: &Path) -> Vec<(&'static str, OsString)> {
     let mut env = private_env(dir);
@@ -157,7 +157,9 @@ fn fake_ytdlp(dir: &Path) -> PathBuf {
         path
     } else {
         let path = dir.join("yt-dlp");
-        let script = "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$*\" >> \"$d/calls.log\"\nif [ -e \"$d/fail.txt\" ]; then echo 'ERROR: [youtube] fake refused' >&2; exit 1; fi\ncat \"$d/info.json\"\n";
+        // Shell builtins only: the child's PATH holds just the test's `bin`, so there is no
+        // dirname or cat to run.
+        let script = "#!/bin/sh\nd=${0%/*}\necho \"$*\" >> \"$d/calls.log\"\nif [ -e \"$d/fail.txt\" ]; then echo 'ERROR: [youtube] fake refused' >&2; exit 1; fi\nwhile IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < \"$d/info.json\"\n";
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
         {
@@ -987,7 +989,9 @@ mod blocked_by_network {
             path
         } else {
             let path = dir.join("yt-dlp");
-            std::fs::write(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit 1\n").unwrap();
+            // Shell builtins only, like `fake_ytdlp`: no cat or dirname on the child's PATH.
+            let script = "#!/bin/sh\nwhile IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\" >&2; done < \"${0%/*}/stderr.txt\"\nexit 1\n";
+            std::fs::write(&path, script).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

@@ -1,7 +1,9 @@
 //! `playr::audio_out`: the device callback (`AudioShared::render`) with its clock, the channel
 //! remixer and the fallback resampler. No audio device is opened here.
 
-use playr::audio_out::{AudioShared, LinearResampler, mix_channels};
+use std::time::Duration;
+
+use playr::audio_out::{AudioShared, LinearResampler, STALL_BEFORE_LOST, error_kills_stream, mix_channels};
 
 /// 1000 Hz stereo, so one frame is exactly one millisecond of clock.
 fn shared_1khz_stereo() -> AudioShared {
@@ -654,4 +656,20 @@ mod resampler {
         r.process(&[], &mut out);
         assert_eq!(out, Vec::<f32>::new());
     }
+}
+
+#[test]
+fn only_errors_that_end_the_stream_make_the_device_count_as_lost() {
+    use cpal::ErrorKind::*;
+    let now = Duration::ZERO;
+    let long = STALL_BEFORE_LOST * 4;
+    for kind in [Xrun, DeviceChanged] {
+        assert!(!error_kills_stream(kind, now) && !error_kills_stream(kind, long), "{kind:?}: the stream carries on");
+    }
+    for kind in [DeviceNotAvailable, StreamInvalidated, HostUnavailable] {
+        assert!(error_kills_stream(kind, now), "{kind:?}: the stream is gone");
+    }
+    // A passing I/O error from the sound server bridge, while the device still asks for sound.
+    assert_eq!(error_kills_stream(BackendError, now), !cfg!(target_os = "linux"));
+    assert!(error_kills_stream(BackendError, long), "a device that stopped asking for sound is lost");
 }
